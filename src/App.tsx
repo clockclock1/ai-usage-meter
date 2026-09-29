@@ -1,4 +1,5 @@
 import { type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { animated, to, useSpring } from "@react-spring/web";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { cursorPosition, getCurrentWindow } from "@tauri-apps/api/window";
@@ -23,8 +24,9 @@ type FloatingSettings = {
   alwaysOnTop: boolean;
   style: "card" | "orb";
   orbExpandDirection: "auto" | "left" | "right";
+  orbWaveSpeed: number;
   displayMode: "available" | "used";
-  theme: "lime" | "cyan" | "violet" | "amber" | "rose";
+  theme: "obsidian" | "titanium" | "spruce" | "dusk" | "abyss" | "cashmere" | "cinnabar" | "cyber";
   proxyMode: "system" | "none" | "custom";
   proxyAddress: string;
   dataDirectory: string;
@@ -37,6 +39,62 @@ type OrbPointerPress = {
   cursorStart: ReturnType<typeof cursorPosition>;
 };
 
+function liquidSurfacePath(level: number, phase: number) {
+  const safeLevel = clamp(level);
+  const baseY = 200 * (1 - safeLevel / 100);
+  const edgeScale = Math.min(1, safeLevel / 12, (100 - safeLevel) / 12);
+  const broadAmplitude = 14 * Math.max(0, edgeScale);
+  const detailAmplitude = 3.2 * Math.max(0, edgeScale);
+  const startX = -12;
+  const endX = 212;
+  const step = 28;
+  const wave = (x: number) => {
+    const broadAngle = (2 * Math.PI * x) / 200 + phase;
+    const detailAngle = (4 * Math.PI * x) / 200 - phase * 0.62;
+    return baseY + broadAmplitude * Math.sin(broadAngle) + detailAmplitude * Math.sin(detailAngle);
+  };
+  const slope = (x: number) => {
+    const broadAngle = (2 * Math.PI * x) / 200 + phase;
+    const detailAngle = (4 * Math.PI * x) / 200 - phase * 0.62;
+    return broadAmplitude * (2 * Math.PI / 200) * Math.cos(broadAngle)
+      + detailAmplitude * (4 * Math.PI / 200) * Math.cos(detailAngle);
+  };
+
+  let path = `M${startX} ${wave(startX)}`;
+  for (let x1 = startX; x1 < endX; x1 += step) {
+    const x2 = Math.min(x1 + step, endX);
+    const span = x2 - x1;
+    const y1 = wave(x1);
+    const y2 = wave(x2);
+    const cp1x = x1 + span / 3;
+    const cp2x = x2 - span / 3;
+    const cp1y = y1 + slope(x1) * span / 3;
+    const cp2y = y2 - slope(x2) * span / 3;
+    path += ` C${cp1x} ${cp1y},${cp2x} ${cp2y},${x2} ${y2}`;
+  }
+  return `${path} L${endX} 212 H${startX} Z`;
+}
+
+function SpringLiquid({ level, speed }: { level: number; speed: number }) {
+  const safeSpeed = Math.min(3, Math.max(0.5, speed));
+  const wave = useSpring({
+    from: { phase: 0 },
+    to: { phase: Math.PI * 2 },
+    loop: true,
+    config: { duration: 8200 / safeSpeed },
+  });
+  const water = useSpring({ value: level, config: { mass: 1.8, tension: 45, friction: 22 } });
+  const path = to([wave.phase, water.value], (phase, currentLevel) => liquidSurfacePath(currentLevel, phase));
+
+  return (
+    <span className="orb-liquid" aria-hidden="true">
+      <svg className="orb-liquid__surface" viewBox="0 0 200 200" preserveAspectRatio="none">
+        <animated.path d={path} />
+      </svg>
+    </span>
+  );
+}
+
 const defaultFloatingSettings: FloatingSettings = {
   visible: false,
   pinned: false,
@@ -44,19 +102,23 @@ const defaultFloatingSettings: FloatingSettings = {
   alwaysOnTop: true,
   style: "card",
   orbExpandDirection: "auto",
+  orbWaveSpeed: 2,
   displayMode: "available",
-  theme: "lime",
+  theme: "obsidian",
   proxyMode: "system",
   proxyAddress: "",
   dataDirectory: "data",
 };
 
-const themes: { id: FloatingSettings["theme"]; label: string; color: string }[] = [
-  { id: "lime", label: "青柠", color: "#c7f36b" },
-  { id: "cyan", label: "海蓝", color: "#62d9e8" },
-  { id: "violet", label: "紫罗兰", color: "#b69cff" },
-  { id: "amber", label: "琥珀", color: "#ffc46b" },
-  { id: "rose", label: "玫瑰", color: "#ff83ae" },
+const themes: { id: FloatingSettings["theme"]; label: string; name: string; colors: string[] }[] = [
+  { id: "obsidian", label: "鎏金", name: "鎏金暗夜", colors: ["#0D0B08", "#191410", "#D9A95C", "#F0E9DA"] },
+  { id: "titanium", label: "翡翠", name: "翡翠墨玉", colors: ["#07100C", "#0E1C15", "#3DDC97", "#E2EFE7"] },
+  { id: "spruce", label: "靛蓝", name: "靛空电蓝", colors: ["#080D16", "#101A2C", "#4DA3FF", "#E4EAF4"] },
+  { id: "dusk", label: "紫曜", name: "紫曜石", colors: ["#0E0A16", "#1A1229", "#A678F0", "#EBE4F6"] },
+  { id: "abyss", label: "绯红", name: "绯红黑曜", colors: ["#120A0B", "#211114", "#EF5D6F", "#F4E5E6"] },
+  { id: "cashmere", label: "铂银", name: "铂银极简", colors: ["#0C0D0E", "#191A1C", "#E6ECF2", "#ECEFF2"] },
+  { id: "cinnabar", label: "熔铜", name: "熔铜落日", colors: ["#100B07", "#1D130A", "#F08C3A", "#F5EBDD"] },
+  { id: "cyber", label: "冰蓝", name: "极夜冰蓝", colors: ["#070C0F", "#0E181D", "#67E0F2", "#E3EEF3"] },
 ];
 
 function initialFloatingSettings(): FloatingSettings {
@@ -169,7 +231,6 @@ function FloatingApp() {
   const [settings, setSettings] = useState(initialFloatingSettings);
   const [orbExpanded, setOrbExpanded] = useState(() => new URLSearchParams(window.location.search).get("expanded") === "1");
   const [orbSide, setOrbSide] = useState<"left" | "right">("right");
-  const [orbAtEdge, setOrbAtEdge] = useState(true);
   const [orbReady, setOrbReady] = useState(() => !("__TAURI_INTERNALS__" in window));
   const [orbDraggingVisual, setOrbDraggingVisual] = useState(false);
   const orbDragging = useRef(false);
@@ -177,6 +238,7 @@ function FloatingApp() {
   const orbHoverTimer = useRef<number | undefined>(undefined);
   const orbTransitionToken = useRef(0);
   const orbPointerPress = useRef<OrbPointerPress | null>(null);
+  const orbSuppressHoverUntil = useRef(0);
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme;
@@ -234,7 +296,6 @@ function FloatingApp() {
         const atEdge = await invoke<boolean>("get_floating_orb_edge_state");
         const targetExpanded = !atEdge;
         if (!active || orbDragging.current) return;
-        setOrbAtEdge(atEdge);
         const side = await invoke<"left" | "right">("get_floating_orb_side");
         if (!active || orbDragging.current) return;
         setOrbSide(side);
@@ -267,7 +328,6 @@ function FloatingApp() {
     if (settings.style !== "orb") return;
     if (orbDragging.current || orbPointerPress.current) return;
     if (orbExpanded === expanded) return;
-    if (!orbAtEdge && !expanded) return;
     const token = ++orbTransitionToken.current;
     if (!("__TAURI_INTERNALS__" in window)) {
       setOrbExpanded(expanded);
@@ -276,20 +336,20 @@ function FloatingApp() {
     try {
       if (expanded) {
         const side = await invoke<"left" | "right">("get_floating_orb_side");
-        if (token !== orbTransitionToken.current) return;
+        if (token !== orbTransitionToken.current || orbDragging.current || orbPointerPress.current) return;
         setOrbSide(side);
         await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-        if (token !== orbTransitionToken.current) return;
+        if (token !== orbTransitionToken.current || orbDragging.current || orbPointerPress.current) return;
         const settledSide = await invoke<"left" | "right">("set_floating_orb_expanded", { expanded: true });
-        if (token !== orbTransitionToken.current) return;
+        if (token !== orbTransitionToken.current || orbDragging.current || orbPointerPress.current) return;
         setOrbSide(settledSide);
         setOrbExpanded(true);
       } else {
         setOrbExpanded(false);
         await new Promise<void>((resolve) => window.setTimeout(resolve, 210));
-        if (token !== orbTransitionToken.current) return;
+        if (token !== orbTransitionToken.current || orbDragging.current || orbPointerPress.current) return;
         const side = await invoke<"left" | "right">("set_floating_orb_expanded", { expanded: false });
-        if (token === orbTransitionToken.current) setOrbSide(side);
+        if (token === orbTransitionToken.current && !orbDragging.current && !orbPointerPress.current) setOrbSide(side);
       }
     } catch {
       if (token === orbTransitionToken.current) setOrbExpanded(!expanded);
@@ -314,9 +374,11 @@ function FloatingApp() {
     if (!orbDragging.current) return;
     void (async () => {
       const token = ++orbTransitionToken.current;
-      const expand = !result.atEdge || (!result.moved && orbWasExpanded.current);
-      setOrbAtEdge(result.atEdge);
+      // A real drag always returns to the compact orb. Expanding immediately
+      // on drop makes the teaser look like it got stuck to the ball.
+      const expand = !result.moved && orbWasExpanded.current;
       setOrbSide(result.side);
+      orbSuppressHoverUntil.current = Date.now() + 280;
       await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
       if (token !== orbTransitionToken.current) return;
       const side = await invoke<"left" | "right">("set_floating_orb_expanded", { expanded: expand });
@@ -324,9 +386,11 @@ function FloatingApp() {
         setOrbSide(side);
         setOrbExpanded(expand);
       }
-      orbDragging.current = false;
-      setOrbDraggingVisual(false);
     })().catch(() => {
+      setOrbExpanded(false);
+    }).finally(() => {
+      // Even a stale transition or failed native call must not leave drag
+      // guards enabled forever.
       orbDragging.current = false;
       setOrbDraggingVisual(false);
     });
@@ -368,6 +432,9 @@ function FloatingApp() {
     if (event.button !== 0 || !orbReady || !("__TAURI_INTERNALS__" in window) || orbDragging.current) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
+    // Cancel any hover resize already in flight before the native drag can
+    // change the window bounds.
+    ++orbTransitionToken.current;
     if (orbHoverTimer.current !== undefined) window.clearTimeout(orbHoverTimer.current);
     orbHoverTimer.current = undefined;
     orbPointerPress.current = {
@@ -391,23 +458,31 @@ function FloatingApp() {
     const press = orbPointerPress.current;
     if (!press || press.pointerId !== event.pointerId) return;
     orbPointerPress.current = null;
-    if (orbAtEdge && !orbExpanded) scheduleOrbOpen(true);
+    // A click should settle on the open state (and cancel a close transition
+    // that may have been interrupted by the press).
+    scheduleOrbOpen(true);
   };
 
   const handleOrbPointerCancel = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (orbPointerPress.current?.pointerId === event.pointerId) orbPointerPress.current = null;
+    if (orbPointerPress.current?.pointerId === event.pointerId) {
+      orbPointerPress.current = null;
+      ++orbTransitionToken.current;
+      if (orbHoverTimer.current !== undefined) window.clearTimeout(orbHoverTimer.current);
+      orbHoverTimer.current = undefined;
+    }
   };
 
-  const floatingBackgroundStyle = { backgroundColor: `rgba(13, 17, 18, ${settings.opacity})` } as CSSProperties;
+  const floatingBackgroundStyle = { backgroundColor: `rgb(var(--surface-rgb) / ${settings.opacity})` } as CSSProperties;
   const primaryMetric = metricValue(usage?.primary?.usedPercent ?? 0, settings.displayMode);
+  const primaryWater = clamp(primaryMetric);
   const secondaryMetric = metricValue(usage?.secondary?.usedPercent ?? 0, settings.displayMode);
 
   if (settings.style === "orb") {
     return (
       <main
         className={`floating-shell floating-shell--orb is-${orbSide} ${orbExpanded ? "is-expanded" : ""} ${orbDraggingVisual ? "is-dragging" : ""}`}
-        onMouseEnter={() => { if (orbReady && orbAtEdge && !orbDragging.current && !orbPointerPress.current) scheduleOrbOpen(true); }}
-        onMouseLeave={() => { if (orbReady && orbAtEdge && !orbDragging.current && !orbPointerPress.current) scheduleOrbOpen(false); }}
+        onMouseEnter={() => { if (orbReady && Date.now() >= orbSuppressHoverUntil.current && !orbDragging.current && !orbPointerPress.current) scheduleOrbOpen(true); }}
+        onMouseLeave={() => { if (orbReady && !orbDragging.current && !orbPointerPress.current) scheduleOrbOpen(false); }}
       >
         <div className="floating-background" style={floatingBackgroundStyle} aria-hidden="true" />
         <div className={`orb-teaser ${orbExpanded ? "is-visible" : ""}`} aria-hidden={!orbExpanded} aria-label="Codex 额度摘要">
@@ -433,9 +508,10 @@ function FloatingApp() {
           aria-label="Codex 额度悬浮球"
           title="拖动调整悬浮球位置"
         >
-          <span className="orb-ring" style={{ "--orb-progress": `${primaryMetric * 3.6}deg` } as CSSProperties}><i /></span>
-          <span className="orb-core"><i /><strong>{Math.round(primaryMetric)}</strong><small>%</small></span>
-          <span className="orb-caption">CODEX</span>
+          <SpringLiquid level={primaryWater} speed={settings.orbWaveSpeed} />
+          <span className={`orb-core ${Math.round(primaryMetric) >= 100 ? "is-three-digit" : ""}`} aria-label={`${Math.round(primaryMetric)}%`}>
+            <strong>{Math.round(primaryMetric)}</strong><small>%</small>
+          </span>
         </button>
       </main>
     );
@@ -575,6 +651,16 @@ function DashboardApp() {
     } catch (reason) { setError(String(reason)); }
   };
 
+  const setAlwaysOnTop = async () => {
+    const next = !floatingSettings.alwaysOnTop;
+    setFloatingSettings((value) => ({ ...value, alwaysOnTop: next }));
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    try {
+      const saved = await invoke<boolean>("set_floating_always_on_top", { alwaysOnTop: next });
+      setFloatingSettings((value) => ({ ...value, alwaysOnTop: saved }));
+    } catch (reason) { setError(String(reason)); }
+  };
+
   const setFloatingStyle = async (style: FloatingSettings["style"]) => {
     setFloatingSettings((value) => ({ ...value, style }));
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -590,6 +676,16 @@ function DashboardApp() {
     try {
       const settings = await invoke<FloatingSettings>("set_floating_orb_expand_direction", { direction });
       setFloatingSettings(settings);
+    } catch (reason) { setError(String(reason)); }
+  };
+
+  const setOrbWaveSpeed = async (speed: number) => {
+    const boundedSpeed = Math.min(3, Math.max(0.5, speed));
+    setFloatingSettings((value) => ({ ...value, orbWaveSpeed: boundedSpeed }));
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    try {
+      const saved = await invoke<number>("set_orb_wave_speed", { speed: boundedSpeed });
+      setFloatingSettings((value) => ({ ...value, orbWaveSpeed: saved }));
     } catch (reason) { setError(String(reason)); }
   };
 
@@ -659,8 +755,8 @@ function DashboardApp() {
               <div className="settings-block">
                 <span className="settings-label">主题配色</span>
                 <div className="theme-options" role="group" aria-label="主题配色">
-                  {themes.map((theme) => <button key={theme.id} className={`theme-option ${floatingSettings.theme === theme.id ? "is-active" : ""}`} onClick={() => void setTheme(theme.id)} aria-pressed={floatingSettings.theme === theme.id} aria-label={`${theme.label}主题`} title={`${theme.label}主题`}>
-                    <i style={{ backgroundColor: theme.color }} />{theme.label}
+                  {themes.map((theme) => <button key={theme.id} className={`theme-option ${floatingSettings.theme === theme.id ? "is-active" : ""}`} onClick={() => void setTheme(theme.id)} aria-pressed={floatingSettings.theme === theme.id} aria-label={`${theme.name}主题`} title={theme.name}>
+                    <i style={{ background: `linear-gradient(135deg, ${theme.colors.join(", ")})` }} />{theme.label}
                   </button>)}
                 </div>
               </div>
@@ -681,13 +777,18 @@ function DashboardApp() {
                 </div>
                 <small className="settings-hint">自动按小球所在屏幕一侧展开；也可以固定向左或向右展开。</small>
               </div>}
+              {floatingSettings.style === "orb" && <label className="wave-speed-control">
+                <span><span className="settings-label">水波速度</span><b>{floatingSettings.orbWaveSpeed.toFixed(1)}×</b></span>
+                <input type="range" min="0.5" max="3" step="0.1" value={floatingSettings.orbWaveSpeed} onChange={(event) => void setOrbWaveSpeed(Number(event.target.value))} aria-label="小球水波速度" />
+                <small className="settings-hint">即时预览并自动保存，范围 0.5×–3.0×</small>
+              </label>}
               <div className="settings-block settings-block--inline">
                 <div><span className="settings-label">悬浮窗固定</span><small>{floatingSettings.pinned ? "主体鼠标穿透" : "可自由拖动"}</small></div>
                 <button className={`compact-action ${floatingSettings.pinned ? "is-active" : ""}`} onClick={setPinned} disabled={floatingSettings.style === "orb"}>{floatingSettings.style === "orb" ? "小球可交互" : floatingSettings.pinned ? "取消固定" : "固定"}</button>
               </div>
               <div className="settings-block settings-block--inline">
-                <div><span className="settings-label">窗口置顶</span><small>持续置顶，高于普通窗口层级</small></div>
-                <span className="topmost-badge">始终</span>
+                <div><span className="settings-label">窗口置顶</span><small>{floatingSettings.alwaysOnTop ? "标准 Windows 置顶层级" : "跟随普通窗口层级"}</small></div>
+                <button className={`compact-action ${floatingSettings.alwaysOnTop ? "is-active" : ""}`} onClick={() => void setAlwaysOnTop()}>{floatingSettings.alwaysOnTop ? "已置顶" : "未置顶"}</button>
               </div>
               <label className="opacity-control"><span>黑色背景透明度 <b>{Math.round((1 - floatingSettings.opacity) * 100)}%</b></span><input type="range" min="0" max="100" value={Math.round((1 - floatingSettings.opacity) * 100)} onChange={(event) => void setOpacity(1 - Number(event.target.value) / 100)} /></label>
               <div className="settings-block proxy-settings">

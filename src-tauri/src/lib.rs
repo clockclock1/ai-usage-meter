@@ -12,7 +12,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -34,6 +34,9 @@ const FLOATING_CARD_HEIGHT: f64 = 150.0;
 const FLOATING_ORB_SIZE: f64 = 68.0;
 const FLOATING_ORB_HOVER_WIDTH: f64 = 230.0;
 const FLOATING_ORB_HOVER_HEIGHT: f64 = 68.0;
+const DEFAULT_ORB_WAVE_SPEED: f64 = 2.0;
+const MIN_ORB_WAVE_SPEED: f64 = 0.5;
+const MAX_ORB_WAVE_SPEED: f64 = 3.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +82,7 @@ struct PersistedState {
     floating_always_on_top: bool,
     floating_style: String,
     floating_orb_expand_direction: String,
+    orb_wave_speed: f64,
     display_mode: String,
     theme: String,
     proxy_mode: String,
@@ -100,8 +104,9 @@ impl Default for PersistedState {
             floating_always_on_top: true,
             floating_style: "card".to_owned(),
             floating_orb_expand_direction: "auto".to_owned(),
+            orb_wave_speed: DEFAULT_ORB_WAVE_SPEED,
             display_mode: "available".to_owned(),
-            theme: "lime".to_owned(),
+            theme: "obsidian".to_owned(),
             proxy_mode: "system".to_owned(),
             proxy_address: String::new(),
         }
@@ -127,6 +132,7 @@ struct FloatingSettings {
     always_on_top: bool,
     style: String,
     orb_expand_direction: String,
+    orb_wave_speed: f64,
     display_mode: String,
     theme: String,
     proxy_mode: String,
@@ -602,8 +608,14 @@ fn set_floating_visible(app: &AppHandle, visible: bool) -> Result<bool, String> 
         .map_err(|_| "本地状态暂时不可用".to_owned())?
         .floating_pinned;
     if visible {
+        let always_on_top = app
+            .state::<AppState>()
+            .data
+            .lock()
+            .map_err(|_| "本地状态暂时不可用".to_owned())?
+            .floating_always_on_top;
         window
-            .set_always_on_top(true)
+            .set_always_on_top(always_on_top)
             .map_err(|error| error.to_string())?;
         window.show().map_err(|error| error.to_string())?;
         if !pinned {
@@ -646,60 +658,6 @@ fn is_floating_pin_hit(
 }
 
 #[cfg(target_os = "windows")]
-fn is_screenshot_capture_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
-    use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        System::Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-        },
-        UI::WindowsAndMessaging::GetWindowThreadProcessId,
-    };
-
-    if hwnd.is_null() {
-        return false;
-    }
-    let mut process_id = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) };
-    if process_id == 0 {
-        return false;
-    }
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-    if process.is_null() {
-        return false;
-    }
-
-    let mut path = [0u16; 512];
-    let mut length = path.len() as u32;
-    let queried =
-        unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) != 0 };
-    unsafe { CloseHandle(process) };
-    if !queried {
-        return false;
-    }
-
-    let path = String::from_utf16_lossy(&path[..length as usize]);
-    let executable = path
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        executable.as_str(),
-        "snippingtool.exe"
-            | "screenclippinghost.exe"
-            | "screensketch.exe"
-            | "sharex.exe"
-            | "greenshot.exe"
-            | "lightshot.exe"
-            | "snagit.exe"
-            | "snagitcapture.exe"
-            | "picpick.exe"
-            | "faststonecapture.exe"
-            | "winsnap.exe"
-    )
-}
-
-#[cfg(target_os = "windows")]
 fn start_click_through_controller(
     window: WebviewWindow,
     pinned: Arc<AtomicBool>,
@@ -707,11 +665,7 @@ fn start_click_through_controller(
 ) {
     use windows_sys::Win32::{
         Foundation::{POINT, RECT},
-        UI::WindowsAndMessaging::{
-            GetCursorPos, GetForegroundWindow, GetWindow, GetWindowRect, IsWindowVisible,
-            SetWindowPos, GW_HWNDPREV, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-            SWP_NOOWNERZORDER, SWP_NOSIZE,
-        },
+        UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect},
     };
 
     let Ok(raw_hwnd) = window.hwnd() else {
@@ -721,9 +675,6 @@ fn start_click_through_controller(
     thread::spawn(move || {
         let hwnd = hwnd_value as windows_sys::Win32::Foundation::HWND;
         let mut last_passthrough = false;
-        let mut last_foreground = std::ptr::null_mut();
-        let mut screenshot_overlay_active = false;
-        let mut last_topmost_check = Instant::now();
         loop {
             let mut point = POINT { x: 0, y: 0 };
             let mut rect = RECT {
@@ -736,51 +687,6 @@ fn start_click_through_controller(
                 unsafe { GetCursorPos(&mut point) != 0 && GetWindowRect(hwnd, &mut rect) != 0 };
             if !valid {
                 break;
-            }
-
-            let foreground = unsafe { GetForegroundWindow() };
-            if foreground != last_foreground {
-                last_foreground = foreground;
-                let capture_active = is_screenshot_capture_window(foreground);
-                if capture_active != screenshot_overlay_active {
-                    screenshot_overlay_active = capture_active;
-                    unsafe {
-                        SetWindowPos(
-                            hwnd,
-                            if capture_active {
-                                HWND_NOTOPMOST
-                            } else {
-                                HWND_TOPMOST
-                            },
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                        );
-                    }
-                }
-            }
-
-            // Reassert the topmost order once per second, except while a
-            // screenshot tool is active. Never activate the window here.
-            if !screenshot_overlay_active && last_topmost_check.elapsed() >= Duration::from_secs(1)
-            {
-                last_topmost_check = Instant::now();
-                if unsafe { IsWindowVisible(hwnd) != 0 && !GetWindow(hwnd, GW_HWNDPREV).is_null() }
-                {
-                    unsafe {
-                        SetWindowPos(
-                            hwnd,
-                            HWND_TOPMOST,
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                        );
-                    }
-                }
             }
 
             let over_pin = is_floating_pin_hit(
@@ -823,6 +729,7 @@ fn get_floating_settings(state: State<'_, AppState>) -> Result<FloatingSettings,
         always_on_top: data.floating_always_on_top,
         style: data.floating_style.clone(),
         orb_expand_direction: data.floating_orb_expand_direction.clone(),
+        orb_wave_speed: data.orb_wave_speed,
         display_mode: data.display_mode.clone(),
         theme: data.theme.clone(),
         proxy_mode: data.proxy_mode.clone(),
@@ -1422,7 +1329,10 @@ fn apply_orb_display(
     panel_visible: bool,
 ) -> Result<String, String> {
     let side = resize_orb_window_from_anchor(window, true, direction, anchor)?;
-    let clipped_to_orb = orb_anchor_is_near_edge(window, anchor)? && !panel_visible;
+    // The webview keeps the expanded bounds so hover can reveal the teaser,
+    // but while collapsed only the orb should receive input. Leaving the full
+    // transparent rectangle hit-testable creates an invisible overlay.
+    let clipped_to_orb = !panel_visible;
     set_orb_window_region(window, clipped_to_orb, &side)?;
     Ok(side)
 }
@@ -1595,6 +1505,12 @@ fn set_floating_orb_expanded(
     expanded: bool,
 ) -> Result<String, String> {
     let window = app.get_webview_window("floating").ok_or("悬浮窗尚未创建")?;
+    // A delayed hover transition must never resize the native window while a
+    // drag is in progress. The front end invalidates stale transitions too,
+    // but this native guard closes the race between queued IPC commands.
+    if state.floating_orb_dragging.load(Ordering::Relaxed) {
+        return Ok(orb_layout_side(&window, "auto")?.to_owned());
+    }
     let (direction, anchor) = {
         let data = state
             .data
@@ -1731,18 +1647,33 @@ fn set_floating_opacity(
 }
 
 #[tauri::command]
+fn set_orb_wave_speed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    speed: f64,
+) -> Result<f64, String> {
+    if !speed.is_finite() {
+        return Err("水波速度无效".to_owned());
+    }
+    let speed = speed.clamp(MIN_ORB_WAVE_SPEED, MAX_ORB_WAVE_SPEED);
+    update_state(&state, |data| data.orb_wave_speed = speed)?;
+    let _ = app.emit("floating-settings-changed", get_floating_settings(state)?);
+    Ok(speed)
+}
+
+#[tauri::command]
 fn set_floating_always_on_top(
     app: AppHandle,
     state: State<'_, AppState>,
-    _always_on_top: bool,
+    always_on_top: bool,
 ) -> Result<bool, String> {
     app.get_webview_window("floating")
         .ok_or("悬浮窗尚未创建")?
-        .set_always_on_top(true)
+        .set_always_on_top(always_on_top)
         .map_err(|error| error.to_string())?;
-    update_state(&state, |data| data.floating_always_on_top = true)?;
+    update_state(&state, |data| data.floating_always_on_top = always_on_top)?;
     let _ = app.emit("floating-settings-changed", get_floating_settings(state)?);
-    Ok(true)
+    Ok(always_on_top)
 }
 
 #[tauri::command]
@@ -1763,7 +1694,7 @@ fn set_display_mode(
 fn set_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -> Result<String, String> {
     if !matches!(
         theme.as_str(),
-        "lime" | "cyan" | "violet" | "amber" | "rose"
+        "obsidian" | "titanium" | "spruce" | "dusk" | "abyss" | "cashmere" | "cinnabar" | "cyber"
     ) {
         return Err("主题配色无效".to_owned());
     }
@@ -1899,7 +1830,7 @@ fn restore_windows(app: &AppHandle, data: &PersistedState) {
         } else {
             position_floating(app);
         }
-        let _ = window.set_always_on_top(true);
+        let _ = window.set_always_on_top(data.floating_always_on_top);
         if data.floating_visible {
             let _ = window.show();
         }
@@ -1923,8 +1854,20 @@ pub fn run() {
             let legacy_file = app.path().app_data_dir()?.join("data/state.json");
             migrate_legacy_state(&legacy_file, &file_path);
             let mut persisted = load_state(&file_path);
-            let repair_topmost_setting = !persisted.floating_always_on_top;
-            persisted.floating_always_on_top = true;
+            let repair_theme_setting = !matches!(
+                persisted.theme.as_str(),
+                "obsidian"
+                    | "titanium"
+                    | "spruce"
+                    | "dusk"
+                    | "abyss"
+                    | "cashmere"
+                    | "cinnabar"
+                    | "cyber"
+            );
+            if repair_theme_setting {
+                persisted.theme = "obsidian".to_owned();
+            }
             let save_sender = start_state_writer(file_path.clone());
             let floating_pinned = Arc::new(AtomicBool::new(persisted.floating_pinned));
             let floating_orb = Arc::new(AtomicBool::new(persisted.floating_style == "orb"));
@@ -1937,9 +1880,11 @@ pub fn run() {
                 floating_orb_dragging: AtomicBool::new(false),
                 floating_orb_expanded: AtomicBool::new(false),
             });
-            if repair_topmost_setting {
+            if repair_theme_setting {
                 let _ = update_state(&app.state::<AppState>(), |data| {
-                    data.floating_always_on_top = true;
+                    if repair_theme_setting {
+                        data.theme = "obsidian".to_owned();
+                    }
                 });
             }
             restore_windows(app.handle(), &persisted);
@@ -2056,6 +2001,7 @@ pub fn run() {
             get_floating_settings,
             set_floating_pinned,
             set_floating_opacity,
+            set_orb_wave_speed,
             set_floating_always_on_top,
             set_floating_style,
             set_floating_orb_expanded,
