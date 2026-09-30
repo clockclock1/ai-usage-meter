@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Codex 额度",
-  "version": "0.6.2",
+  "version": "1.0.0",
   "identifier": "com.codex.quota.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -16,22 +16,34 @@
         "title": "Codex 额度",
         "width": 960,
         "height": 680,
-        "minWidth": 720,
+        "minWidth": 600,
         "minHeight": 600,
         "center": true,
         "decorations": false,
         "visible": true
       },
       {
-        "label": "floating",
-        "title": "Codex 额度悬浮窗",
-        "url": "index.html?view=floating",
-        "width": 68,
+        "label": "compact",
+        "title": "额度紧凑卡片",
+        "url": "index.html?view=floating&style=card",
+        "width": 276,
+        "height": 150,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "decorations": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": false,
+        "transparent": true
+      },
+      {
+        "label": "orb",
+        "title": "额度悬浮小球",
+        "url": "index.html?view=floating&style=orb",
+        "width": 230,
         "height": 68,
-        "minWidth": 60,
-        "minHeight": 60,
-        "maxWidth": 230,
-        "maxHeight": 68,
         "resizable": false,
         "maximizable": false,
         "minimizable": false,
@@ -50,6 +62,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "resources": {
+      "../node_modules/@tokscale/cli-win32-x64-msvc/bin/tokscale.exe": "tokscale.exe"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

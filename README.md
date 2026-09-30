@@ -1,57 +1,39 @@
-# Codex 额度
+# AI Usage Meter
 
-一个使用 Rust、Tauri 2、React 和 TypeScript 构建的 Windows 桌面额度监测器。
+面向多 AI 平台的 Windows 桌面用量监测器，在同一个界面查看额度和 Token 消耗。目前支持 Codex 与 Cursor，并采用可扩展的平台切换结构。支持缓存优先切换、按秒设置自动同步，以及可贴边停靠的悬浮卡片/水波球。
 
-应用使用独立设计的深色额度圆环图标，并为 Windows EXE、安装程序、任务栏和系统托盘生成完整尺寸资源。
+## 下载
 
-应用通过本机 `codex app-server` 的官方 JSON-RPC 接口读取当前 ChatGPT 账户的 Codex 速率限制，不读取或保存登录令牌。
+从 [GitHub Releases](https://github.com/clockclock1/ai-usage-meter/releases) 获取最新 Windows 安装包或独立可执行文件。
 
-## 窗口行为
+## 功能
 
-- 主窗口右上角的“悬浮窗”开关用于显示或隐藏额度悬浮窗；设置里可选择紧凑卡片或浮动小球。
-- 点击主窗口最小化按钮会隐藏到 Windows 系统托盘。
-- 左键点击托盘图标可恢复并聚焦主窗口。
-- 右键点击托盘图标可显示主窗口、切换悬浮窗或完全退出。
-- 点击主窗口关闭按钮会完全退出应用；悬浮窗上的短横线只隐藏悬浮窗。
-- 紧凑卡片未固定时可拖动；固定后不可拖动，并通过 Tauri 原生窗口接口启用鼠标穿透，不会挡住下方应用。
-- 固定状态下可从主窗口或托盘菜单取消固定。
-- 固定后悬浮窗主体鼠标穿透，但悬浮窗上的取消固定按钮仍可点击。
-- 小球采用类似 360 加速球的“圆环 + 信息胶囊”样式；贴边时收起为独立小球并在悬停后展开额度摘要，不贴边时保持展开。小球可拖到任意位置，靠近屏幕边缘会自动吸附，点击小球不会打开主窗口。
-- 浮动小球可在设置中选择自动、向左展开或向右展开，方向会写入本地配置并在下次启动时保留。
-- 主窗口可将悬浮窗黑色背景透明度设为 0%–100%；数值越高背景越透明，文字、数值、进度条和按钮不会随之变淡。
-- 主窗口使用绿色自定义标题栏，与应用界面保持一致。
-- 设置可在“显示可用”和“显示已使用”两种额度形式间切换；主窗口圆环显示所选形式，圆环外侧显示相反形式，悬浮窗同步使用所选形式。
-- 设置提供青柠、海蓝、紫罗兰、琥珀和玫瑰五种主题；选择会保存到 `data/state.json`，并同步应用到主窗口与悬浮窗。
-- 网络支持系统代理（默认）、无代理和自定义本地代理地址；自定义地址支持 `http`、`https` 与 `socks5`。
-- 悬浮窗可单独配置是否始终置顶。
-- Windows 使用单实例运行；再次从任务栏启动应用时会恢复并聚焦已有主窗口。
-- 任务栏右键跳转列表提供“显示主窗口”“显示 / 隐藏悬浮窗”“固定 / 取消固定悬浮窗”和“完全退出”。
-- 安装与覆盖升级都会创建或刷新桌面快捷方式，并绑定独立应用标识和图标。
+- **多平台统计**：侧边栏切换当前平台；目前接入 Codex 与 Cursor，后续可扩展更多 AI 平台。任一时刻只显示所选平台的数据。
+- **额度视角与 Token 视角**：额度视角展示当前周期用量、重置时间与账户信息；Token 视角展示本机可统计到的累计与今日 Token 用量。
+- **独立刷新**：右上角按钮只刷新额度；Token 视角中的“刷新统计”只刷新 Token 数据。
+- **后台定时同步**：默认每 60 秒同步，可设置为 5–86,400 秒。额度与 Token 不依赖当前打开的视角，都会按间隔自动刷新。
+- **平台切换冷却**：切换平台时尝试同时刷新额度与 Token；距离上次自动同步不足设定间隔时，先使用缓存，并在冷却结束后同步，避免每次切换都重复请求。
+- **悬浮显示**：支持紧凑卡片或可拖动、贴边收起的悬浮球；悬浮球水波的速度和幅度可调。
+- **八套主题**：鎏金暗夜、翡翠墨玉、靛空电蓝、紫曜石、绯红黑曜、铂银极简、熔铜落日和极夜冰蓝；字体、进度、水波等颜色随主题切换。
+- **全局设置**：可配置可用量/已用量显示、自动同步间隔、主题、代理和悬浮窗样式。
 
-## 响应与线程
+## 数据来源与隐私
 
-- Codex 额度读取在独立阻塞工作线程执行，不占用 GUI 事件线程。
-- `state.json` 由独立后台写入线程保存；连续移动窗口时自动合并待写状态。
-- 固定悬浮窗的鼠标穿透检测由独立轻量线程处理。
-- 窗口按钮和拖动只负责原生窗口操作，彼此不会等待额度刷新。
+- **Codex 额度**通过本机 Codex App Server 的 JSON-RPC 接口读取；Codex Token 统计读取本机 `~/.codex/sessions` 会话日志。今日用量按本机时区统计。
+- **Cursor 额度**使用 Cursor 桌面端的本机登录状态读取账户用量；Cursor Token 统计由随应用提供的 Tokscale 组件同步并读取其本机缓存。Token 同步会复用新鲜缓存并遵守 Tokscale 的同步节流。
+- 应用不经过本项目的服务器转发统计请求。Cursor 登录凭据会从 Cursor 本机登录数据库读取，并写入当前 Windows 用户目录下的 Tokscale 本地凭据文件（`.config/tokscale/cursor-credentials.json`），供 Tokscale 使用；请妥善保护该 Windows 用户目录。
+- 应用设置、窗口位置和额度缓存保存在可执行文件旁的 `data/state.json`。Codex 会话日志与 Cursor 用量缓存不会上传到本项目。
+- 支持系统代理、关闭代理或自定义 `http`、`https`、`socks5` 代理。
 
-## 本地状态与启动速度
-
-应用会在 EXE 所在目录创建 `data/state.json`。这里会保存首次检索到的 Codex 路径、最后一次成功额度、主窗口位置，以及卡片悬浮窗位置和小球悬浮窗位置两套独立坐标；同时保存悬浮窗样式、展开方向、显示、固定和透明度设置。切换样式不会覆盖另一种样式的位置。下次启动先读取这些信息，再在后台刷新额度；不会保存登录令牌。缓存的 Codex 路径不存在或不能正常响应时，应用会自动重新检索并覆盖旧路径。首次升级到此版本时，如果旧版 `%APPDATA%` 数据存在，会自动迁移一次。
-
-如果旧版本保存的主窗口坐标已经位于断开的显示器或屏幕外，启动时会自动将主窗口移回当前主显示器并保持可见。
-
-## 环境要求
+## 使用要求
 
 - Windows 10/11 与 WebView2
-- Rust MSVC 工具链
-- Node.js 20+
-- 已安装 Codex 桌面应用或 Codex CLI
-- 已在该电脑上使用 ChatGPT 账号登录 Codex；API Key 登录没有 ChatGPT 订阅额度窗口
+- Codex Desktop 或 Codex CLI，并已使用 ChatGPT 账号登录（API Key 登录不提供 ChatGPT 订阅额度窗口）
+- 如需 Cursor 统计：安装 Cursor Desktop，并在应用中登录 Cursor 账号
 
-应用会自动查找 Codex Desktop 的版本目录、npm/nvm 全局安装目录及系统 `PATH`。如果使用自定义安装位置，可设置环境变量 `CODEX_QUOTA_CODEX_PATH` 指向 `codex.exe`。
+应用会自动查找 Codex Desktop、npm/nvm 全局安装目录及系统 `PATH` 中的 Codex。自定义安装位置可通过环境变量 `CODEX_QUOTA_CODEX_PATH` 指定 `codex.exe`。
 
-首次在其他电脑使用时，建议先运行：
+首次在电脑上配置 Codex 时，可在终端检查登录状态：
 
 ```powershell
 codex login
@@ -65,26 +47,26 @@ npm install
 npm run tauri dev
 ```
 
-## 构建安装包
+## 本地构建
 
 ```powershell
 npm run tauri build
 ```
 
-安装包会生成到 `src-tauri/target/release/bundle/`。
+Windows 安装包位于 `src-tauri/target/release/bundle/`。应用同时使用随包提供的 Tokscale Windows 组件来读取 Cursor Token 用量。
 
-## GitHub Actions 自动构建
+## GitHub Actions 构建
 
-`.github/workflows/windows-build.yml` 会在推送分支、创建 Pull Request 或手动运行时，分别构建 Windows x64 和 ARM64 版本。每个架构都会输出：
+`.github/workflows/windows-build.yml` 会在推送分支、创建 Pull Request 或手动运行时构建 Windows x64 和 ARM64 版本。每个架构会生成：
 
-- `Codex-Quota-Windows-x64-Setup.exe` / `Codex-Quota-Windows-arm64-Setup.exe`：NSIS 安装包，会创建或更新桌面快捷方式。
-- `Codex-Quota-Windows-x64.exe` / `Codex-Quota-Windows-arm64.exe`：不经安装器的独立可执行文件。
+- `Codex-Quota-Windows-x64-Setup.exe` / `Codex-Quota-Windows-arm64-Setup.exe`：NSIS 安装包。
+- `Codex-Quota-Windows-x64.exe` / `Codex-Quota-Windows-arm64.exe`：独立可执行文件。
 
-普通工作流运行的文件可从 GitHub Actions 对应运行记录的 Artifacts 下载，保留 14 天。推送 `v` 开头的标签（例如 `v0.6.1`）时，工作流还会将两个架构的安装包和独立 exe 附加到 GitHub Release。ARM64 产物在 Windows 11 ARM64 runner 上原生编译；x64 产物可运行于常见 Intel/AMD 64 位 Windows 电脑。该工作流仅生成 Windows 产物。
+普通工作流产物可从对应运行记录的 Artifacts 下载，保留 14 天。推送 `v` 开头的标签（例如 `v1.0.0`）时，安装包和独立 EXE 会附加到 GitHub Release。工作流只生成 Windows 产物。
 
 ## 本地交叉编译
 
-安装 Rust MSVC 工具链以及对应架构的 C++ 构建工具后，可按需编译单个目标：
+安装 Rust MSVC 工具链和对应架构的 C++ 构建工具后，可编译单个目标：
 
 ```powershell
 # Windows x64（Intel / AMD）
