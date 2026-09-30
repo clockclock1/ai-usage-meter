@@ -63,7 +63,7 @@
     "active": true,
     "targets": ["nsis"],
     "resources": {
-      "../node_modules/@tokscale/cli-win32-x64-msvc/bin/tokscale.exe": "tokscale.exe"
+      "../node_modules/@tokscale/cli-win32-*/bin/tokscale.exe": ""
     },
     "icon": [
       "icons/32x32.png",
