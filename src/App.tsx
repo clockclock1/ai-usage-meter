@@ -655,6 +655,34 @@ function FloatingApp() {
   }, [windowStyle, settings.style, settings.orbExpandDirection]);
 
   useEffect(() => {
+    if (windowStyle !== "orb") {
+      document.documentElement.classList.remove("orb-window-blurred");
+      return;
+    }
+    const applyBlurred = (blurred: boolean) => {
+      document.documentElement.classList.toggle("orb-window-blurred", blurred);
+    };
+    const syncBlurClass = () => applyBlurred(!document.hasFocus());
+    syncBlurClass();
+    window.addEventListener("blur", syncBlurClass);
+    window.addEventListener("focus", syncBlurClass);
+    let unlisten: (() => void) | undefined;
+    if ("__TAURI_INTERNALS__" in window) {
+      void listen<boolean>("orb-window-focus", (event) => {
+        applyBlurred(!event.payload);
+      }).then((fn) => {
+        unlisten = fn;
+      });
+    }
+    return () => {
+      window.removeEventListener("blur", syncBlurClass);
+      window.removeEventListener("focus", syncBlurClass);
+      unlisten?.();
+      document.documentElement.classList.remove("orb-window-blurred");
+    };
+  }, [windowStyle]);
+
+  useEffect(() => {
     if (windowStyle !== "orb" || settings.style !== "orb" || !("__TAURI_INTERNALS__" in window)) return;
     let active = true;
     setOrbReady(false);
@@ -723,7 +751,7 @@ function FloatingApp() {
           if (!atEdge) return;
         }
         setOrbExpanded(false);
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 210));
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 200));
         if (token !== orbTransitionToken.current || orbDragging.current || orbPointerPress.current) return;
         if ("__TAURI_INTERNALS__" in window) {
           const stillAtEdge = await invoke<boolean>("get_floating_orb_edge_state");
@@ -913,7 +941,6 @@ function FloatingApp() {
           onPointerUp={handleOrbPointerUp}
           onPointerCancel={handleOrbPointerCancel}
           aria-label={`${platformLabel} 额度悬浮球`}
-          title="拖动调整悬浮球位置"
         >
           <SpringLiquid level={primaryWater} speed={settings.orbWaveSpeed} amplitude={settings.orbWaveAmplitude} dragging={orbDraggingVisual} running={settings.visible && settings.style === "orb" && pageIsVisible} />
           <span className={`orb-core ${Math.round(primaryMetric) >= 100 ? "is-three-digit" : ""}`} aria-label={`${Math.round(primaryMetric)}%`}>

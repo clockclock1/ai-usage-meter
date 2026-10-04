@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -2529,11 +2529,12 @@ fn start_floating_orb_drag(
         x: cursor_start_x,
         y: cursor_start_y,
     };
-    if let Err(error) = set_orb_window_region(&window, false, "left") {
+    if let Err(error) = resize_orb_window_from_anchor(&window, false, &direction, anchor) {
         state.floating_orb_dragging.store(false, Ordering::Relaxed);
         return Err(error);
     }
-    if let Err(error) = resize_orb_window_from_anchor(&window, false, &direction, anchor) {
+    let drag_side = orb_layout_side_for_anchor(&window, &direction, anchor).unwrap_or("left");
+    if let Err(error) = set_orb_window_region(&window, true, drag_side) {
         state.floating_orb_dragging.store(false, Ordering::Relaxed);
         return Err(error);
     }
@@ -2718,8 +2719,27 @@ fn is_pointer_inside_orb(
     dx * dx + dy * dy <= radius * radius
 }
 
-const ORB_NONCLIENT_FRAME_STYLE_MASK: isize = 0x00C0_0000; // WS_BORDER | WS_DLGFRAME
-const ORB_WINDOW_EDGE_EX_STYLE_MASK: isize = 0x0000_0100; // WS_EX_WINDOWEDGE
+const ORB_NONCLIENT_FRAME_STYLE_MASK: isize = 0x00CF_0000; // WS_CAPTION|WS_THICKFRAME|WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX
+const ORB_WINDOW_EDGE_EX_STYLE_MASK: isize = 0x0002_0301; // WS_EX_WINDOWEDGE|WS_EX_CLIENTEDGE|WS_EX_DLGMODALFRAME|WS_EX_STATICEDGE
+
+#[cfg(target_os = "windows")]
+static ORB_WNDPROC_INSTALLED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static ORB_HOOKED_HWND: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "windows")]
+static ORB_ORIG_WNDPROC: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "windows")]
+static ORB_CLIP_COLLAPSED: AtomicBool = AtomicBool::new(true);
+#[cfg(target_os = "windows")]
+static ORB_CLIP_SIDE_RIGHT: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static ORB_CLIP_ORB_SIZE: AtomicU32 = AtomicU32::new(FLOATING_ORB_SIZE);
+#[cfg(target_os = "windows")]
+static ORB_CLIP_DOCKED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static ORB_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(true);
+#[cfg(target_os = "windows")]
+static ORB_FRAME_REPAIR_REENTRY: AtomicBool = AtomicBool::new(false);
 
 fn strip_orb_native_frame_styles(style: isize, extended_style: isize) -> (isize, isize) {
     (
@@ -2729,9 +2749,210 @@ fn strip_orb_native_frame_styles(style: isize, extended_style: isize) -> (isize,
 }
 
 #[cfg(target_os = "windows")]
+unsafe fn create_docked_capsule_region(
+    width: i32,
+    height: i32,
+    docked_right: bool,
+) -> windows_sys::Win32::Graphics::Gdi::HRGN {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CombineRgn, CreateEllipticRgn, CreateRectRgn, DeleteObject, RGN_OR,
+    };
+
+    // Flat against the screen edge, rounded on the free end — matches CSS
+    // `.is-docked` half-stadium so the docked edge cannot leak white.
+    let body = if docked_right {
+        CreateRectRgn(height / 2, 0, width, height)
+    } else {
+        CreateRectRgn(0, 0, width.saturating_sub(height / 2).max(1), height)
+    };
+    let cap = if docked_right {
+        CreateEllipticRgn(0, 0, height, height)
+    } else {
+        CreateEllipticRgn(width.saturating_sub(height), 0, width, height)
+    };
+    if body.is_null() || cap.is_null() {
+        if !body.is_null() {
+            DeleteObject(body as _);
+        }
+        if !cap.is_null() {
+            DeleteObject(cap as _);
+        }
+        return std::ptr::null_mut();
+    }
+    let combined = CreateRectRgn(0, 0, 0, 0);
+    if combined.is_null() || CombineRgn(combined, body, cap, RGN_OR) == 0 {
+        DeleteObject(body as _);
+        DeleteObject(cap as _);
+        if !combined.is_null() {
+            DeleteObject(combined as _);
+        }
+        return std::ptr::null_mut();
+    }
+    DeleteObject(body as _);
+    DeleteObject(cap as _);
+    combined
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn apply_orb_clip_region_to_hwnd(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    clip: bool,
+) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateEllipticRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    if !clip {
+        SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
+        return;
+    }
+
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if GetWindowRect(hwnd, &mut rect) == 0 {
+        return;
+    }
+    // SetWindowRgn coordinates are relative to the window's top-left, including
+    // any non-client area — use the outer size, not the client size.
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let collapsed = ORB_CLIP_COLLAPSED.load(Ordering::Relaxed);
+    let side_right = ORB_CLIP_SIDE_RIGHT.load(Ordering::Relaxed);
+    let region = if collapsed {
+        let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
+        let scale = if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 };
+        let orb_size = (ORB_CLIP_ORB_SIZE.load(Ordering::Relaxed) as f64 * scale).round() as i32;
+        let margin = (FLOATING_ORB_VISUAL_INSET * scale).round() as i32;
+        if orb_size <= 0 {
+            return;
+        }
+        let left = if side_right {
+            (width - margin - orb_size).max(0)
+        } else {
+            margin.min(width.saturating_sub(orb_size).max(0))
+        };
+        let top = margin.min(height.saturating_sub(orb_size).max(0));
+        CreateEllipticRgn(left, top, left + orb_size, top + orb_size)
+    } else if ORB_CLIP_DOCKED.load(Ordering::Relaxed) {
+        create_docked_capsule_region(width, height, side_right)
+    } else {
+        CreateRoundRectRgn(0, 0, width, height, height, height)
+    };
+    if region.is_null() {
+        return;
+    }
+    if SetWindowRgn(hwnd, region, 1) == 0 {
+        DeleteObject(region as _);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn orb_hwnd_has_caption_chrome(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE};
+
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+    (style & ORB_NONCLIENT_FRAME_STYLE_MASK) != 0
+}
+
+#[cfg(target_os = "windows")]
+fn repair_orb_frame_and_clip(hwnd: windows_sys::Win32::Foundation::HWND) {
+    if ORB_FRAME_REPAIR_REENTRY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    remove_orb_native_frame(hwnd);
+    unsafe { apply_orb_clip_region_to_hwnd(hwnd, true) };
+    ORB_FRAME_REPAIR_REENTRY.store(false, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn orb_window_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, DefWindowProcW, WM_ACTIVATE, WM_ERASEBKGND, WM_NCACTIVATE, WM_NCCALCSIZE,
+        WM_NCPAINT, WM_WINDOWPOSCHANGED,
+    };
+
+    // Focus / NC messages can make WebView2 or DWM repaint the rectangular
+    // frame and (on Win11) reinstate caption chrome. Re-strip + re-clip.
+    match msg {
+        WM_NCACTIVATE => {
+            ORB_WINDOW_FOCUSED.store(wparam != 0, Ordering::Relaxed);
+            repair_orb_frame_and_clip(hwnd);
+            return 1;
+        }
+        WM_ACTIVATE => {
+            let active = (wparam as usize & 0xffff) != 0;
+            ORB_WINDOW_FOCUSED.store(active, Ordering::Relaxed);
+            repair_orb_frame_and_clip(hwnd);
+        }
+        WM_WINDOWPOSCHANGED => {
+            // Caption chrome can come back after resize; only repair then.
+            // Always-applying the region here re-enters via SetWindowRgn.
+            if orb_hwnd_has_caption_chrome(hwnd) {
+                repair_orb_frame_and_clip(hwnd);
+            }
+        }
+        WM_NCPAINT => return 0,
+        WM_ERASEBKGND => return 1,
+        WM_NCCALCSIZE if wparam != 0 => return 0,
+        _ => {}
+    }
+
+    let orig = ORB_ORIG_WNDPROC.load(Ordering::Relaxed);
+    if orig == 0 {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let proc = Some(std::mem::transmute::<
+        usize,
+        unsafe extern "system" fn(
+            windows_sys::Win32::Foundation::HWND,
+            u32,
+            windows_sys::Win32::Foundation::WPARAM,
+            windows_sys::Win32::Foundation::LPARAM,
+        ) -> windows_sys::Win32::Foundation::LRESULT,
+    >(orig));
+    CallWindowProcW(proc, hwnd, msg, wparam, lparam)
+}
+
+#[cfg(target_os = "windows")]
+fn install_orb_window_message_hook(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+
+    let hwnd_bits = hwnd as usize;
+    if ORB_HOOKED_HWND.load(Ordering::SeqCst) == hwnd_bits && ORB_WNDPROC_INSTALLED.load(Ordering::SeqCst)
+    {
+        return;
+    }
+    let previous = unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            orb_window_proc as *const () as usize as isize,
+        )
+    };
+    ORB_ORIG_WNDPROC.store(previous as usize, Ordering::SeqCst);
+    ORB_HOOKED_HWND.store(hwnd_bits, Ordering::SeqCst);
+    ORB_WNDPROC_INSTALLED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
 fn remove_orb_native_frame(hwnd: windows_sys::Win32::Foundation::HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, GWL_EXSTYLE, GWL_STYLE,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     };
 
@@ -2749,6 +2970,9 @@ fn remove_orb_native_frame(hwnd: windows_sys::Win32::Foundation::HWND) {
     if extended_style_changed {
         unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, extended_style) };
     }
+    let empty: [u16; 1] = [0];
+    unsafe { SetWindowTextW(hwnd, empty.as_ptr()) };
+
     if style_changed || extended_style_changed {
         unsafe {
             SetWindowPos(
@@ -2762,18 +2986,23 @@ fn remove_orb_native_frame(hwnd: windows_sys::Win32::Foundation::HWND) {
             );
         }
     }
+    // FRAMECHANGED can drop the shaped region / resurrect caption paint — clip last.
+    unsafe { apply_orb_clip_region_to_hwnd(hwnd, true) };
 }
 
 #[cfg(target_os = "windows")]
 fn disable_floating_orb_dwm_border(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMNCRP_DISABLED,
+        DWMNCRENDERINGPOLICY, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
+        DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMSBT_NONE, DWMWCP_DONOTROUND,
+        DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE,
     };
+    use windows::Win32::UI::Controls::MARGINS;
 
-    // Windows 11 can paint its own light border around a shaped, transparent
-    // HWND. That border sits outside the CSS orb and looks like a white arc
-    // when the native ellipse region is clipped. Keep the orb's outline fully
-    // controlled by the webview instead of inheriting the system frame color.
+    // Keep the orb outline fully under CSS control. Windows 11 may otherwise
+    // paint a light system border, caption chrome, Mica backdrop, or rounded
+    // frame that reads as a white strip with a close button around the capsule.
     let no_border = DWMWA_COLOR_NONE;
     let _ = unsafe {
         DwmSetWindowAttribute(
@@ -2783,25 +3012,136 @@ fn disable_floating_orb_dwm_border(hwnd: windows::Win32::Foundation::HWND) {
             std::mem::size_of_val(&no_border) as u32,
         )
     };
+    let nc_policy = DWMNCRP_DISABLED;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            (&nc_policy as *const DWMNCRENDERINGPOLICY).cast(),
+            std::mem::size_of_val(&nc_policy) as u32,
+        )
+    };
+    let corner = DWMWCP_DONOTROUND;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&corner as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            std::mem::size_of_val(&corner) as u32,
+        )
+    };
+    let backdrop = DWMSBT_NONE;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&backdrop as *const DWM_SYSTEMBACKDROP_TYPE).cast(),
+            std::mem::size_of_val(&backdrop) as u32,
+        )
+    };
+    let margins = MARGINS {
+        cxLeftWidth: 0,
+        cxRightWidth: 0,
+        cyTopHeight: 0,
+        cyBottomHeight: 0,
+    };
+    let _ = unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) };
 }
 
 #[cfg(target_os = "windows")]
 fn set_orb_window_region(
     window: &WebviewWindow,
-    _collapsed: bool,
-    _side: &str,
+    collapsed: bool,
+    side: &str,
 ) -> Result<(), String> {
-    use windows_sys::Win32::Graphics::Gdi::SetWindowRgn;
+    let focused = window.is_focused().unwrap_or(true);
+    set_orb_window_region_for_focus(window, collapsed, side, focused)
+}
+
+#[cfg(target_os = "windows")]
+fn orb_theme_surface_color(theme: &str) -> tauri::window::Color {
+    use tauri::window::Color;
+    // Keep in sync with --surface-rgb in App.css.
+    match theme {
+        "titanium" => Color(11, 23, 18, 255),
+        "spruce" => Color(12, 19, 32, 255),
+        "dusk" => Color(21, 15, 32, 255),
+        "abyss" => Color(26, 14, 16, 255),
+        "cashmere" => Color(19, 20, 21, 255),
+        "cinnabar" => Color(23, 15, 8, 255),
+        "cyber" => Color(11, 18, 22, 255),
+        _ => Color(20, 17, 9, 255),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn set_orb_window_region_for_focus(
+    window: &WebviewWindow,
+    collapsed: bool,
+    side: &str,
+    focused: bool,
+) -> Result<(), String> {
+    use tauri::window::Color;
 
     let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    // Do not call set_decorations here — toggling it on focus churn reintroduces
+    // Win11 caption chrome (light strip + ✕) over the orb.
+    let _ = window.set_title("");
     remove_orb_native_frame(hwnd.0 as _);
     disable_floating_orb_dwm_border(hwnd);
-    // Never shape-clip the WebView with a GDI region. Native region edges are
-    // hard binary clips; the CSS circle already has proper alpha antialiasing.
-    if unsafe { SetWindowRgn(hwnd.0 as _, std::ptr::null_mut(), 0) } == 0 {
-        return Err("无法恢复悬浮球窗口区域".to_owned());
+    install_orb_window_message_hook(hwnd.0 as _);
+
+    ORB_CLIP_COLLAPSED.store(collapsed, Ordering::Relaxed);
+    ORB_CLIP_SIDE_RIGHT.store(side == "right", Ordering::Relaxed);
+    ORB_CLIP_ORB_SIZE.store(orb_size_for_window(window), Ordering::Relaxed);
+    ORB_WINDOW_FOCUSED.store(focused, Ordering::Relaxed);
+    let app_state = window.app_handle().state::<AppState>();
+    let docked = window
+        .outer_position()
+        .ok()
+        .and_then(|position| {
+            orb_is_near_edge(
+                window,
+                &app_state,
+                SavedPosition {
+                    x: position.x,
+                    y: position.y,
+                },
+            )
+            .ok()
+        })
+        .unwrap_or(false);
+    ORB_CLIP_DOCKED.store(docked, Ordering::Relaxed);
+
+    // Always shape-clip. Clearing the region on focus exposes the rectangular
+    // window frame (and any ghost titlebar) — that is the docked "✕ strip" bug.
+    // When unfocused, also force an opaque surface-colored WebView backing so
+    // transparent CSS padding cannot show WebView2's default white fill.
+    if focused {
+        let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+    } else {
+        let theme = window
+            .app_handle()
+            .state::<AppState>()
+            .data
+            .lock()
+            .ok()
+            .map(|data| data.theme.clone())
+            .unwrap_or_else(|| "obsidian".to_owned());
+        let _ = window.set_background_color(Some(orb_theme_surface_color(&theme)));
     }
+    unsafe { apply_orb_clip_region_to_hwnd(hwnd.0 as _, true) };
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_orb_window_region_for_focus(
+    window: &WebviewWindow,
+    collapsed: bool,
+    side: &str,
+    _focused: bool,
+) -> Result<(), String> {
+    set_orb_window_region(window, collapsed, side)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2956,10 +3296,9 @@ fn apply_orb_display(
     panel_visible: bool,
 ) -> Result<String, String> {
     let side = resize_orb_window_from_anchor(window, true, direction, anchor)?;
-    // Keep the expanded WebView bounds for a smooth hover reveal. A dedicated
-    // hit-test loop passes clicks through the transparent area when collapsed.
-    let _ = panel_visible;
-    set_orb_window_region(window, false, &side)?;
+    // Keep expanded WebView bounds for a smooth hover reveal. Refresh chrome /
+    // transparency; when unfocused the region clip hides WebView white fill.
+    set_orb_window_region(window, !panel_visible, &side)?;
     Ok(side)
 }
 
@@ -3137,7 +3476,6 @@ fn set_floating_style(
     let _ = orb_window.hide();
     state.floating_orb.store(style == "orb", Ordering::Relaxed);
     state.floating_orb_expanded.store(false, Ordering::Relaxed);
-    set_orb_window_region(&orb_window, false, "left")?;
     update_state(&state, |data| data.floating_style = style.clone())?;
     target_window
         .set_size(floating_logical_size(&style, false, orb_size, card_scale))
@@ -3159,8 +3497,18 @@ fn set_floating_style(
         target_window
             .set_position(PhysicalPosition::new(position.x, position.y))
             .map_err(|error| error.to_string())?;
+        if style == "orb" {
+            let side = orb_layout_side_for_anchor(
+                target_window,
+                &target_position.floating_orb_expand_direction,
+                position,
+            )
+            .unwrap_or("left");
+            set_orb_window_region(&orb_window, true, side)?;
+        }
     } else if style == "orb" {
         let _ = snap_orb_to_edge(target_window);
+        set_orb_window_region(&orb_window, true, "left")?;
     } else {
         position_floating(&app);
     }
@@ -3714,15 +4062,18 @@ fn restore_windows(app: &AppHandle, data: &PersistedState) {
             data.floating_orb_size,
             data.floating_card_scale,
         ));
-        let _ = set_orb_window_region(&window, false, "left");
         let saved_position = saved_floating_position(data, "orb")
             .map(|position| normalize_orb_dock_anchor(&window, position).unwrap_or(position));
-        if let Some(position) = saved_position {
+        let region_side = if let Some(position) = saved_position {
             let _ = window.set_position(PhysicalPosition::new(position.x, position.y));
             let _ = remember_floating_position_for_style(&app.state::<AppState>(), "orb", position);
+            orb_layout_side_for_anchor(&window, &data.floating_orb_expand_direction, position)
+                .unwrap_or("left")
         } else {
             let _ = snap_orb_to_edge(&window);
-        }
+            "left"
+        };
+        let _ = set_orb_window_region(&window, true, region_side);
         let _ = window.set_always_on_top(data.floating_always_on_top);
         let _ = window.hide();
         if data.floating_visible && data.floating_style == "orb" {
@@ -3877,6 +4228,37 @@ pub fn run() {
                         .and_then(|orb| orb_anchor_from_window(&orb, &state, saved))
                         .unwrap_or(saved);
                     let _ = remember_floating_position_for_style(&state, "orb", orb_position);
+                }
+            }
+            WindowEvent::Focused(focused) if window.label() == "orb" => {
+                if let Some(orb) = window.app_handle().get_webview_window("orb") {
+                    let state = window.app_handle().state::<AppState>();
+                    let expanded = state.floating_orb_expanded.load(Ordering::Relaxed);
+                    let side = orb
+                        .outer_position()
+                        .ok()
+                        .and_then(|position| {
+                            orb_anchor_from_window(
+                                &orb,
+                                &state,
+                                SavedPosition {
+                                    x: position.x,
+                                    y: position.y,
+                                },
+                            )
+                            .and_then(|anchor| {
+                                let direction = state
+                                    .data
+                                    .lock()
+                                    .ok()?
+                                    .floating_orb_expand_direction
+                                    .clone();
+                                orb_layout_side_for_anchor(&orb, &direction, anchor).ok()
+                            })
+                        })
+                        .unwrap_or("left");
+                    let _ = set_orb_window_region_for_focus(&orb, !expanded, side, *focused);
+                    let _ = orb.emit("orb-window-focus", *focused);
                 }
             }
             WindowEvent::Resized(_)
@@ -4536,17 +4918,25 @@ mod tests {
     fn removes_the_nonclient_frame_from_a_real_win32_window() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GetWindowLongPtrW, GWL_EXSTYLE, GWL_STYLE, WS_BORDER,
-            WS_DLGFRAME, WS_EX_WINDOWEDGE, WS_POPUP,
+            WS_CAPTION, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_STATICEDGE,
+            WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
         };
 
         let class_name = "STATIC\0".encode_utf16().collect::<Vec<_>>();
         let title = "orb-frame-regression\0".encode_utf16().collect::<Vec<_>>();
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_WINDOWEDGE,
+                WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE,
                 class_name.as_ptr(),
                 title.as_ptr(),
-                WS_POPUP | WS_BORDER | WS_DLGFRAME,
+                WS_POPUP
+                    | WS_CAPTION
+                    | WS_THICKFRAME
+                    | WS_SYSMENU
+                    | WS_MINIMIZEBOX
+                    | WS_MAXIMIZEBOX
+                    | WS_BORDER
+                    | WS_DLGFRAME,
                 0,
                 0,
                 68,
@@ -4563,8 +4953,23 @@ mod tests {
 
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
         let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-        assert_eq!(style & (WS_BORDER | WS_DLGFRAME) as isize, 0);
-        assert_eq!(extended_style & WS_EX_WINDOWEDGE as isize, 0);
+        assert_eq!(
+            style
+                & (WS_CAPTION
+                    | WS_THICKFRAME
+                    | WS_SYSMENU
+                    | WS_MINIMIZEBOX
+                    | WS_MAXIMIZEBOX
+                    | WS_BORDER
+                    | WS_DLGFRAME) as isize,
+            0
+        );
+        assert_eq!(
+            extended_style
+                & (WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE)
+                    as isize,
+            0
+        );
 
         unsafe { DestroyWindow(hwnd) };
     }
