@@ -1,6 +1,6 @@
 [package]
 name = "codex-quota"
-version = "1.0.3"
+version = "1.0.4"
 description = "A multi-platform AI usage monitor for Windows"
 authors = ["Codex Meter"]
 edition = "2021"

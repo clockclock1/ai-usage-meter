@@ -74,9 +74,10 @@ jobs:
             throw "NSIS installer was not produced in $installerDir"
           }
 
+          $assetPrefix = if ($arch -eq "x64") { "AI-Usage-Meter-64bit" } else { "AI-Usage-Meter-ARM64" }
           New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
-          Copy-Item -LiteralPath $appExe -Destination "artifacts/Codex额度-Windows-$arch-便携版.exe"
-          Copy-Item -LiteralPath $installer.FullName -Destination "artifacts/Codex额度-Windows-$arch-安装包.exe"
+          Copy-Item -LiteralPath $appExe -Destination "artifacts/$assetPrefix.exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination "artifacts/$assetPrefix-Setup.exe"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -104,10 +105,19 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Publish release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          name: Codex 额度 v${{ github.ref_name }}
-          body_path: .github/release-notes.zh.md
-          files: release-assets/*.exe
-          fail_on_unmatched_files: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $title = "AI Usage Meter $tag"
+          gh release view $tag 1>$null 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $tag --title $title --notes-file .github/release-notes.zh.md --draft=false
+          } else {
+            gh release create $tag --title $title --notes-file .github/release-notes.zh.md --verify-tag
+          }
+          $files = Get-ChildItem -LiteralPath release-assets -Filter *.exe
+          if ($files.Count -lt 1) { throw "No release exe files found" }
+          gh release upload $tag @($files.FullName) --clobber

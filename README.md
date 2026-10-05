@@ -59,8 +59,8 @@ Windows 安装包位于 `src-tauri/target/release/bundle/`。应用同时使用�
 
 `.github/workflows/windows-build.yml` 会在推送分支、创建 Pull Request 或手动运行时构建 Windows x64 和 ARM64 版本。每个架构会生成：
 
-- `Codex-Quota-Windows-x64-Setup.exe` / `Codex-Quota-Windows-arm64-Setup.exe`：NSIS 安装包。
-- `Codex-Quota-Windows-x64.exe` / `Codex-Quota-Windows-arm64.exe`：独立可执行文件。
+- `AI-Usage-Meter-64bit-Setup.exe` / `AI-Usage-Meter-ARM64-Setup.exe`：NSIS 安装包。
+- `AI-Usage-Meter-64bit.exe` / `AI-Usage-Meter-ARM64.exe`：独立可执行文件。
 
 普通工作流产物可从对应运行记录的 Artifacts 下载，保留 14 天。推送 `v` 开头的标签（例如 `v1.0.0`）时，安装包和独立 EXE 会附加到 GitHub Release。工作流只生成 Windows 产物。
 
