@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    codex_quota_lib::run()
+    ai_usage_meter_lib::run()
 }

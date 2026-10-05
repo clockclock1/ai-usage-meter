@@ -1,5 +1,5 @@
-import { type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSpring } from "@react-spring/web";
+import { type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { animated, useSpring, useTransition } from "@react-spring/web";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { cursorPosition, getCurrentWindow } from "@tauri-apps/api/window";
@@ -114,6 +114,7 @@ const MIN_SYNC_INTERVAL_SECS = 5;
 const MAX_SYNC_INTERVAL_SECS = 86_400;
 const LIQUID_WAVE_NODE_COUNT = 33;
 const LIQUID_FIXED_STEP = 1 / 60;
+const LIQUID_WAVE_VISUAL_GAIN = 0.38;
 
 function usePageVisibility() {
   const [visible, setVisible] = useState(() => document.visibilityState === "visible");
@@ -128,11 +129,63 @@ function usePageVisibility() {
   return visible;
 }
 
+function PrettyScroller({ children, active = true }: { children: ReactNode; active?: boolean }) {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const [thumb, setThumb] = useState({ top: 0, height: 40, visible: false });
+
+  const update = useCallback(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const overflow = el.scrollHeight - el.clientHeight;
+    if (overflow <= 2) {
+      setThumb((value) => (value.visible ? { ...value, visible: false } : value));
+      return;
+    }
+    const height = Math.max(36, (el.clientHeight / el.scrollHeight) * el.clientHeight);
+    const top = (el.scrollTop / overflow) * (el.clientHeight - height);
+    setThumb({ top, height, visible: true });
+  }, []);
+
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    update();
+    const resize = new ResizeObserver(update);
+    resize.observe(el);
+    const mutate = new MutationObserver(update);
+    mutate.observe(el, { childList: true, subtree: true, attributes: true });
+    return () => {
+      resize.disconnect();
+      mutate.disconnect();
+    };
+  }, [update]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(update);
+    const timer = window.setTimeout(update, 40);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+    };
+  }, [active, update]);
+
+  return (
+    <div className="pretty-scroll">
+      <div ref={viewportRef} className="pretty-scroll__viewport" onScroll={update}>
+        {children}
+      </div>
+      <div className="pretty-scroll__rail" aria-hidden="true">
+        {thumb.visible && <i className="pretty-scroll__thumb" style={{ height: `${thumb.height}px`, transform: `translateY(${thumb.top}px)` }} />}
+      </div>
+    </div>
+  );
+}
+
 function liquidSurfacePath(level: number, displacement: Float32Array, amplitude: number) {
   const safeLevel = clamp(level);
   const baseY = 200 * (1 - safeLevel / 100);
   const edgeScale = Math.min(1, safeLevel / 12, (100 - safeLevel) / 12);
-  const scale = Math.max(0, edgeScale) * amplitude;
+  const scale = Math.max(0, edgeScale) * amplitude * LIQUID_WAVE_VISUAL_GAIN;
   const spacing = 200 / (displacement.length - 1);
   const yAt = (index: number) => baseY + displacement[index] * scale;
   const format = (value: number) => Math.round(value * 100) / 100;
@@ -361,14 +414,14 @@ async function refreshPlatformTokenData(platform: Platform): Promise<TokenUsageS
 }
 
 const themes: { id: FloatingSettings["theme"]; label: string; name: string; colors: string[] }[] = [
-  { id: "obsidian", label: "鎏金", name: "鎏金暗夜", colors: ["#0D0B08", "#141109", "#191410", "#372C19", "#F0E9DA", "#9B8E74", "#D9A95C", "#F2D492", "#2A2113", "#E8BD6E"] },
-  { id: "titanium", label: "翡翠", name: "翡翠墨玉", colors: ["#07100C", "#0B1712", "#0E1C15", "#1E3A2C", "#E2EFE7", "#7FA391", "#3DDC97", "#8FF0C6", "#143024", "#4FE8A6"] },
-  { id: "spruce", label: "靛蓝", name: "靛空电蓝", colors: ["#080D16", "#0C1320", "#101A2C", "#22344F", "#E4EAF4", "#8296B3", "#4DA3FF", "#8CC6FF", "#1A2C44", "#5FB4FF"] },
-  { id: "dusk", label: "紫曜", name: "紫曜石", colors: ["#0E0A16", "#150F20", "#1A1229", "#32244C", "#EBE4F6", "#9D8DB8", "#A678F0", "#D0B0FF", "#291D3F", "#B58AFF"] },
-  { id: "abyss", label: "绯红", name: "绯红黑曜", colors: ["#120A0B", "#1A0E10", "#211114", "#421F24", "#F4E5E6", "#B28A8E", "#EF5D6F", "#FF9AA6", "#33181D", "#FF7585"] },
-  { id: "cashmere", label: "铂银", name: "铂银极简", colors: ["#0C0D0E", "#131415", "#191A1C", "#2C2E31", "#ECEFF2", "#8D949C", "#DFE6EE", "#FFFFFF", "#25272A", "#F5F8FB"] },
-  { id: "cinnabar", label: "熔铜", name: "熔铜落日", colors: ["#100B07", "#170F08", "#1D130A", "#3B2814", "#F5EBDD", "#B1977A", "#F08C3A", "#FFB870", "#2E1E0E", "#FFA050"] },
-  { id: "cyber", label: "冰蓝", name: "极夜冰蓝", colors: ["#070C0F", "#0B1216", "#0E181D", "#1D333D", "#E3EEF3", "#7E9AA8", "#67E0F2", "#AEF3FC", "#132A32", "#7CE8F8"] },
+  { id: "obsidian", label: "曜石", name: "曜石紫罗兰", colors: ["#121113", "#1A191B", "#232225", "#3C393F", "#EEEEF0", "#B5B2BC", "#BAA7FF", "#D0C3FF", "#323035", "#BAA7FF"] },
+  { id: "titanium", label: "翡翠", name: "翡翠岩青", colors: ["#101211", "#171918", "#202221", "#373B39", "#ECEEED", "#ADB5B2", "#1FD8A4", "#67E4C1", "#2E3130", "#1FD8A4"] },
+  { id: "spruce", label: "深海", name: "深海幽蓝", colors: ["#111113", "#18191B", "#212225", "#363A3F", "#EDEEF0", "#B0B4BA", "#70B8FF", "#9ECFFF", "#2E3135", "#70B8FF"] },
+  { id: "dusk", label: "暮色", name: "暮色玫瑰", colors: ["#121113", "#1A191B", "#232225", "#3C393F", "#EEEEF0", "#B5B2BC", "#FF8DCC", "#FFB1DC", "#323035", "#FF8DCC"] },
+  { id: "abyss", label: "暗夜", name: "暗夜宝石红", colors: ["#121113", "#1A191B", "#232225", "#3C393F", "#EEEEF0", "#B5B2BC", "#FF949D", "#FFB6BC", "#323035", "#FF949D"] },
+  { id: "cashmere", label: "铂银", name: "铂银极简", colors: ["#111111", "#191919", "#222222", "#3A3A3A", "#EEEEEE", "#B4B4B4", "#B4B4B4", "#CCCCCC", "#313131", "#B4B4B4"] },
+  { id: "cinnabar", label: "琥珀", name: "琥珀熔金", colors: ["#111110", "#191918", "#222221", "#3B3A37", "#EEEEEC", "#B5B3AD", "#FFCA16", "#FFDB61", "#31312E", "#FFCA16"] },
+  { id: "cyber", label: "冰川", name: "冰川暮青", colors: ["#111113", "#18191B", "#212225", "#363A3F", "#EDEEF0", "#B0B4BA", "#4CCCE6", "#85DCEE", "#2E3135", "#4CCCE6"] },
 ];
 
 function initialFloatingSettings(): FloatingSettings {
@@ -496,7 +549,7 @@ function MainTitlebar() {
   const maximize = () => "__TAURI_INTERNALS__" in window && void getCurrentWindow().toggleMaximize();
   const close = () => "__TAURI_INTERNALS__" in window && void getCurrentWindow().close();
   return <div className="main-titlebar" onMouseDown={(event) => startNativeDrag(event)}>
-    <div className="main-titlebar__title"><i /> 额度监测</div>
+    <div className="main-titlebar__title"><i /> AI Usage Meter</div>
     <div className="main-titlebar__actions">
       <button onClick={minimize} aria-label="最小化"><svg viewBox="0 0 12 12"><path d="M2 8.5h8" /></svg></button>
       <button onClick={maximize} aria-label="最大化或还原"><svg viewBox="0 0 12 12"><rect x="2.5" y="2.5" width="7" height="7" /></svg></button>
@@ -955,7 +1008,7 @@ function FloatingApp() {
     <main className="floating-shell floating-shell--card" style={floatingWindowStyle}>
       <div className="floating-background" style={floatingBackgroundStyle} aria-hidden="true" />
       <header className="floating-header" onMouseDown={(event) => startNativeDrag(event, !settings.pinned)}>
-        <div className="floating-brand"><i /> {platformLabel.toUpperCase()} METER</div>
+        <div className="floating-brand"><i /> AI USAGE METER</div>
         <div className="floating-actions">
           <button className={settings.pinned ? "is-active" : ""} onClick={togglePin} aria-label={settings.pinned ? "取消固定" : "固定并启用鼠标穿透"} title={settings.pinned ? "取消固定" : "固定并启用鼠标穿透"}>
             <svg viewBox="0 0 24 24"><path d="m8 4 8 8M14 3l7 7-4 1-4 4-1 4-7-7 4-1 4-4 1-4ZM5 19l4-4" /></svg>
@@ -999,12 +1052,14 @@ function TokenOverview({
   error,
   previewOnly,
   onRefresh,
+  active = true,
 }: {
   stats: TokenUsageStats | null;
   loading: boolean;
   error: string | null;
   previewOnly: boolean;
   onRefresh: () => void;
+  active?: boolean;
 }) {
   const updatedAt = stats?.updatedAt
     ? new Date(stats.updatedAt * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
@@ -1012,7 +1067,7 @@ function TokenOverview({
   const totalTokens = stats?.available ? formatTokenCount(stats.totalTokens) : "—";
   const todayTokens = stats?.available ? formatTokenCount(stats.todayTokens) : "—";
   return (
-    <section className="token-view" id="token-view" role="tabpanel" aria-labelledby="main-view-tab-tokens">
+    <section className="token-view" id={active ? "token-view" : undefined} role="tabpanel" aria-labelledby="main-view-tab-tokens">
       <header className="token-view__heading">
         <div>
           <span className="eyebrow">LOCAL TOKEN LEDGER / 01</span>
@@ -1063,14 +1118,15 @@ function DashboardApp() {
   const [mainView, setMainView] = useState<"quota" | "tokens">("quota");
   const [activePlatform, setActivePlatform] = useState<Platform>(() => {
     try {
-      return window.localStorage.getItem("quota-meter-platform") === "cursor" ? "cursor" : "codex";
+      const saved = window.localStorage.getItem("ai-usage-meter-platform") ?? window.localStorage.getItem("quota-meter-platform");
+      return saved === "cursor" ? "cursor" : "codex";
     } catch {
       return "codex";
     }
   });
   const [sidebarExpanded, setSidebarExpanded] = useState(() => {
     try {
-      const saved = window.localStorage.getItem("quota-meter-sidebar-collapsed");
+      const saved = window.localStorage.getItem("ai-usage-meter-sidebar-collapsed") ?? window.localStorage.getItem("quota-meter-sidebar-collapsed");
       return saved === null ? window.innerWidth > 700 : saved !== "true";
     } catch {
       return window.innerWidth > 700;
@@ -1112,11 +1168,20 @@ function DashboardApp() {
   const autoRetryTimer = useRef<number | undefined>(undefined);
   const activePlatformRef = useRef(activePlatform);
   const autoRefreshRef = useRef<() => void>(() => undefined);
+  const settingsWrapRef = useRef<HTMLDivElement>(null);
   activePlatformRef.current = activePlatform;
+  const sceneKey = `${activePlatform}:${mainView}`;
+  const sceneTransition = useTransition(sceneKey, {
+    keys: sceneKey,
+    from: { opacity: 0, transform: "translate3d(0, 18px, 0) scale(0.975)" },
+    enter: { opacity: 1, transform: "translate3d(0, 0px, 0) scale(1)" },
+    leave: { opacity: 0, transform: "translate3d(0, -14px, 0) scale(0.99)" },
+    config: { tension: 280, friction: 32 },
+  });
 
   useEffect(() => {
     try {
-      window.localStorage.setItem("quota-meter-platform", activePlatform);
+      window.localStorage.setItem("ai-usage-meter-platform", activePlatform);
     } catch {
       // The selection remains usable if browser storage is unavailable.
     }
@@ -1124,7 +1189,7 @@ function DashboardApp() {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem("quota-meter-sidebar-collapsed", String(!sidebarExpanded));
+      window.localStorage.setItem("ai-usage-meter-sidebar-collapsed", String(!sidebarExpanded));
     } catch {
       // The sidebar remains controllable if browser storage is unavailable.
     }
@@ -1466,6 +1531,26 @@ function DashboardApp() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!showFloatingControls) return;
+    const close = (event: Event) => {
+      const target = event.target;
+      if (target instanceof Node && settingsWrapRef.current?.contains(target)) return;
+      setShowFloatingControls(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowFloatingControls(false);
+    };
+    document.addEventListener("pointerdown", close, true);
+    document.addEventListener("mousedown", close, true);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", close, true);
+      document.removeEventListener("mousedown", close, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [showFloatingControls]);
+
   const toggleFloatingWindow = async () => {
     if (!("__TAURI_INTERNALS__" in window)) {
       setFloatingSettings((value) => ({ ...value, visible: !value.visible }));
@@ -1700,7 +1785,7 @@ function DashboardApp() {
       <section className="dashboard-panel">
       <div className="ambient ambient--one" /><div className="ambient ambient--two" />
       <header className="topbar">
-        <div className="brand"><div className="brand__mark"><span /></div><div><div className="brand__name">{activePlatform === "codex" ? "CODEX METER" : "CURSOR METER"}</div><div className="brand__sub">额度与 Token</div></div></div>
+        <div className="brand"><div className="brand__mark"><span /></div><div><div className="brand__name">AI USAGE METER</div><div className="brand__sub">{activePlatform === "codex" ? "Codex · 额度与 Token" : "Cursor · 额度与 Token"}</div></div></div>
         <nav className="main-view-tabs" role="tablist" aria-label="主界面视角">
           <button id="main-view-tab-quota" className={mainView === "quota" ? "is-active" : ""} role="tab" aria-controls="quota-view" aria-selected={mainView === "quota"} onClick={() => setMainView("quota")}>
             <span>01</span><strong>额度视角</strong>
@@ -1716,11 +1801,12 @@ function DashboardApp() {
             <span className="toggle-track"><i /></span>
             <span className="sidebar-action-label">悬浮窗</span>
           </button>
-          <div className="floating-settings-wrap">
+          <div className="floating-settings-wrap" ref={settingsWrapRef}>
             <button className={`settings-button ${showFloatingControls ? "is-active" : ""}`} onClick={() => setShowFloatingControls((value) => !value)} disabled={isDesktopApp && !floatingSettingsLoaded} aria-expanded={showFloatingControls} aria-label="全局设置" title="全局设置">
               <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7ZM19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6V20h-4v-.08a1.7 1.7 0 0 0-1-.6 1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1H4v-4h.08a1.7 1.7 0 0 0 .6-1 1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6V4h4v.08a1.7 1.7 0 0 0 1 .6 1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.38.33.72.6 1h.08v4H20c-.27.28-.48.62-.6 1Z" /></svg>
             </button>
-            {showFloatingControls && <section className="floating-popover">
+            <section className={`floating-popover ${showFloatingControls ? "is-open" : ""}`} aria-hidden={!showFloatingControls}>
+              <PrettyScroller active={showFloatingControls}>
               <div className="popover-heading"><div><span>显示与连接</span><strong>GLOBAL DISPLAY / SETTINGS</strong></div><span className="settings-state">自动保存</span></div>
               <div className="settings-block">
                 <span className="settings-label">额度显示形式</span>
@@ -1783,25 +1869,29 @@ function DashboardApp() {
                 <input type="range" min={MIN_CARD_SCALE} max={MAX_CARD_SCALE} step="5" value={floatingSettings.cardScale} onChange={(event) => void setCardScale(Number(event.target.value))} aria-label="紧凑卡片尺寸" />
                 <small className="settings-hint">整体缩放 {MIN_CARD_SCALE}%–{MAX_CARD_SCALE}%，不影响主窗口大小。</small>
               </label>
-              {floatingSettings.style === "orb" && <div className="settings-block">
-                <span className="settings-label">小球展开方向</span>
-                <div className="segment-control segment-control--three">
-                  <button className={floatingSettings.orbExpandDirection === "auto" ? "is-active" : ""} onClick={() => void setOrbExpandDirection("auto")}>自动</button>
-                  <button className={floatingSettings.orbExpandDirection === "left" ? "is-active" : ""} onClick={() => void setOrbExpandDirection("left")}>向左展开</button>
-                  <button className={floatingSettings.orbExpandDirection === "right" ? "is-active" : ""} onClick={() => void setOrbExpandDirection("right")}>向右展开</button>
+              <div className={`settings-reveal ${floatingSettings.style === "orb" ? "is-open" : ""}`}>
+                <div className="settings-reveal__inner">
+                  <div className="settings-block">
+                    <span className="settings-label">小球展开方向</span>
+                    <div className="segment-control segment-control--three">
+                      <button className={floatingSettings.orbExpandDirection === "auto" ? "is-active" : ""} onClick={() => void setOrbExpandDirection("auto")}>自动</button>
+                      <button className={floatingSettings.orbExpandDirection === "left" ? "is-active" : ""} onClick={() => void setOrbExpandDirection("left")}>向左展开</button>
+                      <button className={floatingSettings.orbExpandDirection === "right" ? "is-active" : ""} onClick={() => void setOrbExpandDirection("right")}>向右展开</button>
+                    </div>
+                    <small className="settings-hint">自动按小球所在屏幕一侧展开；也可以固定向左或向右展开。</small>
+                  </div>
+                  <label className="wave-speed-control">
+                    <span><span className="settings-label">水波速度</span><b>{floatingSettings.orbWaveSpeed.toFixed(1)}×</b></span>
+                    <input type="range" min="0.5" max="3" step="0.1" value={floatingSettings.orbWaveSpeed} onChange={(event) => void setOrbWaveSpeed(Number(event.target.value))} aria-label="小球水波速度" />
+                    <small className="settings-hint">即时预览并自动保存，范围 0.5×–3.0×</small>
+                  </label>
+                  <label className="wave-speed-control wave-amplitude-control">
+                    <span><span className="settings-label">水波幅度</span><b>{floatingSettings.orbWaveAmplitude.toFixed(1)}×</b></span>
+                    <input type="range" min={MIN_ORB_WAVE_AMPLITUDE} max={MAX_ORB_WAVE_AMPLITUDE} step="0.1" value={floatingSettings.orbWaveAmplitude} onChange={(event) => void setOrbWaveAmplitude(Number(event.target.value))} aria-label="小球水波幅度" />
+                    <small className="settings-hint">只调整波浪起伏，不改变百分比液位；范围 0.5×–4.0×</small>
+                  </label>
                 </div>
-                <small className="settings-hint">自动按小球所在屏幕一侧展开；也可以固定向左或向右展开。</small>
-              </div>}
-              {floatingSettings.style === "orb" && <label className="wave-speed-control">
-                <span><span className="settings-label">水波速度</span><b>{floatingSettings.orbWaveSpeed.toFixed(1)}×</b></span>
-                <input type="range" min="0.5" max="3" step="0.1" value={floatingSettings.orbWaveSpeed} onChange={(event) => void setOrbWaveSpeed(Number(event.target.value))} aria-label="小球水波速度" />
-                <small className="settings-hint">即时预览并自动保存，范围 0.5×–3.0×</small>
-              </label>}
-              {floatingSettings.style === "orb" && <label className="wave-speed-control wave-amplitude-control">
-                <span><span className="settings-label">水波幅度</span><b>{floatingSettings.orbWaveAmplitude.toFixed(1)}×</b></span>
-                <input type="range" min={MIN_ORB_WAVE_AMPLITUDE} max={MAX_ORB_WAVE_AMPLITUDE} step="0.1" value={floatingSettings.orbWaveAmplitude} onChange={(event) => void setOrbWaveAmplitude(Number(event.target.value))} aria-label="小球水波幅度" />
-                <small className="settings-hint">只调整波浪起伏，不改变百分比液位；范围 0.5×–4.0×</small>
-              </label>}
+              </div>
               <div className="settings-block settings-block--inline">
                 <div><span className="settings-label">悬浮窗固定</span><small>{floatingSettings.pinned ? "主体鼠标穿透" : "可自由拖动"}</small></div>
                 <button className={`compact-action ${floatingSettings.pinned ? "is-active" : ""}`} onClick={setPinned} disabled={floatingSettings.style === "orb"}>{floatingSettings.style === "orb" ? "小球可交互" : floatingSettings.pinned ? "取消固定" : "固定"}</button>
@@ -1818,11 +1908,16 @@ function DashboardApp() {
                   <label><input type="radio" name="proxy" checked={floatingSettings.proxyMode === "none"} onChange={() => void saveProxy("none")} />无代理</label>
                   <label><input type="radio" name="proxy" checked={floatingSettings.proxyMode === "custom"} onChange={() => setFloatingSettings((value) => ({ ...value, proxyMode: "custom" }))} />本地代理</label>
                 </div>
-                {floatingSettings.proxyMode === "custom" && <div className="proxy-input-row"><input value={proxyAddressDraft} onChange={(event) => setProxyAddressDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void saveProxy("custom"); }} placeholder="http://127.0.0.1:7890" aria-label="本地代理地址" /><button onClick={() => void saveProxy("custom")}>保存</button></div>}
+                <div className={`settings-reveal ${floatingSettings.proxyMode === "custom" ? "is-open" : ""}`}>
+                  <div className="settings-reveal__inner">
+                    <div className="proxy-input-row"><input value={proxyAddressDraft} onChange={(event) => setProxyAddressDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void saveProxy("custom"); }} placeholder="http://127.0.0.1:7890" aria-label="本地代理地址" /><button onClick={() => void saveProxy("custom")}>保存</button></div>
+                  </div>
+                </div>
               </div>
               <p>{floatingSettings.pinned ? "固定后主体会穿透鼠标，顶部图钉仍可取消固定。" : "设置会写入 EXE 同目录的 data 文件夹。"}</p>
               <small title={floatingSettings.dataDirectory}>设置自动保存在 data 文件夹</small>
-            </section>}
+              </PrettyScroller>
+            </section>
           </div>
           <button className="refresh-button" onClick={refreshActiveQuota} disabled={displayedQuotaLoading || (isDesktopApp && !floatingSettingsLoaded)} aria-label="刷新额度" title="刷新额度">
             <svg className={displayedQuotaLoading ? "is-spinning" : ""} viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 8.1A7 7 0 0 1 18.6 7M17.9 15.9A7 7 0 0 1 5.4 17" /></svg>
@@ -1831,16 +1926,20 @@ function DashboardApp() {
         </div>
       </header>
 
-      {mainView === "tokens" ? (
+      <div className="view-stage">
+      {sceneTransition((style, key) => (
+        <animated.div className="view-pane" style={style} aria-hidden={key !== sceneKey}>
+          {key.endsWith(":tokens") ? (
         <TokenOverview
           stats={displayedTokenStats}
           loading={displayedTokenLoading || (isDesktopApp && !floatingSettingsLoaded)}
           error={displayedTokenError}
           previewOnly={!("__TAURI_INTERNALS__" in window)}
           onRefresh={refreshActiveTokenStats}
+          active={key === sceneKey}
         />
-      ) : (
-        <section className="quota-view" id="quota-view" role="tabpanel" aria-labelledby="main-view-tab-quota">
+          ) : (
+        <section className="quota-view" id={key === sceneKey ? "quota-view" : undefined} role="tabpanel" aria-labelledby="main-view-tab-quota">
         {startingQuotaRead ? (
           <section className="initializing-panel" role="status" aria-live="polite">
             <span className="error-panel__code">{floatingSettingsLoaded ? "QUOTA SYNC / 01" : "LOCAL SERVICE / STARTING"}</span>
@@ -1878,8 +1977,11 @@ function DashboardApp() {
           </>
         )}
         </section>
-      )}
-      <footer><span>{activePlatform === "codex" ? "CODEX METER / WINDOWS" : "CURSOR METER / WINDOWS"}</span><span>LOCAL TOKEN LEDGER · PLATFORM SELECTED</span></footer>
+          )}
+        </animated.div>
+      ))}
+      </div>
+      <footer><span>AI USAGE METER / WINDOWS</span><span>{activePlatform === "codex" ? "CODEX" : "CURSOR"} · LOCAL TOKEN LEDGER</span></footer>
       </section>
       </div>
     </main>

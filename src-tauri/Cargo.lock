@@ -30,6 +30,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-usage-meter"
+version = "1.0.5"
+dependencies = [
+ "base64 0.22.1",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
+ "time",
+ "windows",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -498,24 +516,6 @@ dependencies = [
  "num-traits",
  "serde",
  "windows-link 0.2.1",
-]
-
-[[package]]
-name = "codex-quota"
-version = "1.0.4"
-dependencies = [
- "base64 0.22.1",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tauri-plugin-single-instance",
- "time",
- "windows",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

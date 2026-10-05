@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex 额度",
-  "version": "1.0.4",
-  "identifier": "com.codex.quota.desktop",
+  "productName": "AI Usage Meter",
+  "version": "1.0.5",
+  "identifier": "com.ai-usage-meter.desktop",
+  "mainBinaryName": "AI-Usage-Meter",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Codex 额度",
+        "title": "AI Usage Meter",
         "width": 960,
         "height": 680,
         "minWidth": 600,
@@ -24,7 +25,7 @@
       },
       {
         "label": "compact",
-        "title": "额度紧凑卡片",
+        "title": "AI Usage Meter 悬浮卡片",
         "url": "index.html?view=floating&style=card",
         "width": 276,
         "height": 150,
@@ -64,6 +65,14 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "publisher": "AI Usage Meter",
+    "copyright": "Copyright © 2026 AI Usage Meter",
+    "homepage": "https://github.com/clockclock1/ai-usage-meter",
+    "category": "Utility",
+    "shortDescription": "Multi-platform AI usage meter for Windows",
+    "longDescription": "Windows desktop app for quota and token usage across multiple AI platforms. Currently supports Codex and Cursor, with configurable sync, cached switching, and a dockable floating orb.",
+    "license": "Apache-2.0",
+    "licenseFile": "../LICENSE",
     "resources": {
       "../node_modules/@tokscale/cli-win32-*/bin/tokscale.exe": ""
     },
@@ -76,6 +85,9 @@
     ],
     "windows": {
       "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true,
+        "startMenuFolder": "AI Usage Meter",
         "installerHooks": "./windows/installer-hooks.nsh"
       }
     }

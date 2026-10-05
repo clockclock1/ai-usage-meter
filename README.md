@@ -14,13 +14,13 @@
 - **后台定时同步**：默认每 60 秒同步，可设置为 5–86,400 秒。额度与 Token 不依赖当前打开的视角，都会按间隔自动刷新。
 - **平台切换冷却**：切换平台时尝试同时刷新额度与 Token；距离上次自动同步不足设定间隔时，先使用缓存，并在冷却结束后同步，避免每次切换都重复请求。
 - **悬浮显示**：支持紧凑卡片或可拖动、贴边收起的悬浮球；悬浮球水波的速度和幅度可调。
-- **八套主题**：鎏金暗夜、翡翠墨玉、靛空电蓝、紫曜石、绯红黑曜、铂银极简、熔铜落日和极夜冰蓝；字体、进度、水波等颜色随主题切换。
+- **八套主题**：曜石紫罗兰、翡翠岩青、深海幽蓝、暮色玫瑰、暗夜宝石红、铂银极简、琥珀熔金、冰川暮青；字体、进度、水波等颜色随主题切换。
 - **全局设置**：可配置可用量/已用量显示、自动同步间隔、主题、代理和悬浮窗样式。
 
 ## 数据来源与隐私
 
-- **Codex 额度**通过本机 Codex App Server 的 JSON-RPC 接口读取；Codex Token 统计读取本机 `~/.codex/sessions` 会话日志。今日用量按本机时区统计。
-- **Cursor 额度**使用 Cursor 桌面端的本机登录状态读取账户用量；Cursor Token 统计由随应用提供的 Tokscale 组件同步并读取其本机缓存。Token 同步会复用新鲜缓存并遵守 Tokscale 的同步节流。
+- **Codex 平台额度**通过本机 Codex App Server 的 JSON-RPC 接口读取；Codex Token 统计读取本机 `~/.codex/sessions` 会话日志。今日用量按本机时区统计。
+- **Cursor 平台额度**使用 Cursor 桌面端的本机登录状态读取账户用量；Cursor Token 统计由随应用提供的 Tokscale 组件同步并读取其本机缓存。Token 同步会复用新鲜缓存并遵守 Tokscale 的同步节流。
 - 应用不经过本项目的服务器转发统计请求。Cursor 登录凭据会从 Cursor 本机登录数据库读取，并写入当前 Windows 用户目录下的 Tokscale 本地凭据文件（`.config/tokscale/cursor-credentials.json`），供 Tokscale 使用；请妥善保护该 Windows 用户目录。
 - 应用设置、窗口位置和额度缓存保存在可执行文件旁的 `data/state.json`。Codex 会话日志与 Cursor 用量缓存不会上传到本项目。
 - 支持系统代理、关闭代理或自定义 `http`、`https`、`socks5` 代理。
@@ -31,7 +31,7 @@
 - Codex Desktop 或 Codex CLI，并已使用 ChatGPT 账号登录（API Key 登录不提供 ChatGPT 订阅额度窗口）
 - 如需 Cursor 统计：安装 Cursor Desktop，并在应用中登录 Cursor 账号
 
-应用会自动查找 Codex Desktop、npm/nvm 全局安装目录及系统 `PATH` 中的 Codex。自定义安装位置可通过环境变量 `CODEX_QUOTA_CODEX_PATH` 指定 `codex.exe`。
+应用会自动查找 Codex Desktop、npm/nvm 全局安装目录及系统 `PATH` 中的 Codex。自定义安装位置可通过环境变量 `AI_USAGE_METER_CODEX_PATH` 指定 `codex.exe`。
 
 首次在电脑上配置 Codex 时，可在终端检查登录状态：
 

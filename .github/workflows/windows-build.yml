@@ -60,7 +60,10 @@ jobs:
           $target = "${{ matrix.target }}"
           $arch = "${{ matrix.arch }}"
           $releaseDir = Join-Path "src-tauri/target" "$target/release"
-          $appExe = Join-Path $releaseDir "codex-quota.exe"
+          $appExe = Join-Path $releaseDir "AI-Usage-Meter.exe"
+          if (!(Test-Path -LiteralPath $appExe)) {
+            $appExe = Join-Path $releaseDir "ai-usage-meter.exe"
+          }
           if (!(Test-Path -LiteralPath $appExe)) {
             throw "Standalone executable was not produced: $appExe"
           }

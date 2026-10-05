@@ -1,8 +1,8 @@
 [package]
-name = "codex-quota"
-version = "1.0.4"
-description = "A multi-platform AI usage monitor for Windows"
-authors = ["Codex Meter"]
+name = "ai-usage-meter"
+version = "1.0.5"
+description = "Multi-platform AI usage meter for Windows"
+authors = ["AI Usage Meter"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "codex_quota_lib"
+name = "ai_usage_meter_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

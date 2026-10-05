@@ -19,7 +19,7 @@ use windows::{
     },
 };
 
-pub const APP_USER_MODEL_ID: &str = "com.codex.quota.desktop";
+pub const APP_USER_MODEL_ID: &str = "com.ai-usage-meter.desktop";
 
 pub fn initialize_taskbar() {
     let app_id = HSTRING::from(APP_USER_MODEL_ID);

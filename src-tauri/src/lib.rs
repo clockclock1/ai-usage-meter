@@ -395,7 +395,7 @@ fn find_codex_launcher(cached: Option<&Path>) -> Result<CodexLauncher, String> {
     if let Some(path) = cached {
         add_candidate(&mut candidates, path.to_path_buf());
     }
-    if let Some(path) = env::var_os("CODEX_QUOTA_CODEX_PATH") {
+    if let Some(path) = env::var_os("AI_USAGE_METER_CODEX_PATH").or_else(|| env::var_os("CODEX_QUOTA_CODEX_PATH")) {
         add_candidate(&mut candidates, PathBuf::from(path));
     }
     if let Some(local) = env::var_os("LOCALAPPDATA") {
@@ -432,7 +432,7 @@ fn find_codex_launcher(cached: Option<&Path>) -> Result<CodexLauncher, String> {
         );
     }
     candidates.into_iter().next().map(launcher_from_path).ok_or_else(||
-        "未找到 Codex。请先安装 Codex 桌面应用或 Codex CLI，并登录 ChatGPT 账号；也可以通过 CODEX_QUOTA_CODEX_PATH 指定 codex.exe。".to_owned())
+        "未找到 Codex。请先安装 Codex 桌面应用或 Codex CLI，并登录 ChatGPT 账号；也可以通过 AI_USAGE_METER_CODEX_PATH 指定 codex.exe。".to_owned())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1480,7 +1480,7 @@ fn query_codex(
         }
     });
     for message in [
-        json!({"method":"initialize","id":1,"params":{"clientInfo":{"name":"codex_quota","title":"Codex 额度","version":env!("CARGO_PKG_VERSION")}}}),
+        json!({"method":"initialize","id":1,"params":{"clientInfo":{"name":"ai_usage_meter","title":"AI Usage Meter","version":env!("CARGO_PKG_VERSION")}}}),
         json!({"method":"initialized","params":{}}),
         json!({"method":"account/rateLimits/read","id":2,"params":{}}),
         json!({"method":"account/read","id":3,"params":{"refreshToken":false}}),
@@ -3948,14 +3948,7 @@ pub fn run() {
             let mut persisted = load_state(&file_path);
             let repair_theme_setting = !matches!(
                 persisted.theme.as_str(),
-                "obsidian"
-                    | "titanium"
-                    | "spruce"
-                    | "dusk"
-                    | "abyss"
-                    | "cashmere"
-                    | "cinnabar"
-                    | "cyber"
+                "obsidian" | "titanium" | "spruce" | "dusk" | "abyss" | "cashmere" | "cinnabar" | "cyber"
             );
             if repair_theme_setting {
                 persisted.theme = "obsidian".to_owned();
@@ -4017,9 +4010,9 @@ pub fn run() {
             )?;
             let quit = MenuItem::with_id(app, "quit", "完全退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &floating, &pin, &quit])?;
-            TrayIconBuilder::with_id("codex-quota-tray")
+            TrayIconBuilder::with_id("ai-usage-meter-tray")
                 .icon(app.default_window_icon().expect("default app icon").clone())
-                .tooltip("Codex 额度")
+                .tooltip("AI Usage Meter")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -4425,19 +4418,19 @@ mod tests {
     #[test]
     fn parses_windows_jump_list_actions() {
         assert_eq!(
-            launch_action(&["codex-quota.exe".into(), "--toggle-floating".into()]),
+            launch_action(&["AI-Usage-Meter.exe".into(), "--toggle-floating".into()]),
             LaunchAction::ToggleFloating
         );
         assert_eq!(
-            launch_action(&["codex-quota.exe".into(), "--toggle-pin".into()]),
+            launch_action(&["AI-Usage-Meter.exe".into(), "--toggle-pin".into()]),
             LaunchAction::TogglePin
         );
         assert_eq!(
-            launch_action(&["codex-quota.exe".into(), "--quit".into()]),
+            launch_action(&["AI-Usage-Meter.exe".into(), "--quit".into()]),
             LaunchAction::Quit
         );
         assert_eq!(
-            launch_action(&["codex-quota.exe".into()]),
+            launch_action(&["AI-Usage-Meter.exe".into()]),
             LaunchAction::ShowMain
         );
     }
