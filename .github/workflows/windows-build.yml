@@ -75,8 +75,8 @@ jobs:
           }
 
           New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
-          Copy-Item -LiteralPath $appExe -Destination "artifacts/Codex-Quota-Windows-$arch.exe"
-          Copy-Item -LiteralPath $installer.FullName -Destination "artifacts/Codex-Quota-Windows-$arch-Setup.exe"
+          Copy-Item -LiteralPath $appExe -Destination "artifacts/Codex额度-Windows-$arch-便携版.exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination "artifacts/Codex额度-Windows-$arch-安装包.exe"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -94,6 +94,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
       - name: Download all architecture artifacts
         uses: actions/download-artifact@v4
         with:
@@ -104,5 +107,7 @@ jobs:
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
+          name: Codex 额度 v${{ github.ref_name }}
+          body_path: .github/release-notes.zh.md
           files: release-assets/*.exe
           fail_on_unmatched_files: true

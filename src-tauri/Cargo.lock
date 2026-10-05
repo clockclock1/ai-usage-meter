@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "codex-quota"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "base64 0.22.1",
  "reqwest 0.12.28",
