@@ -2729,16 +2729,6 @@ static ORB_HOOKED_HWND: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "windows")]
 static ORB_ORIG_WNDPROC: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "windows")]
-static ORB_CLIP_COLLAPSED: AtomicBool = AtomicBool::new(true);
-#[cfg(target_os = "windows")]
-static ORB_CLIP_SIDE_RIGHT: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static ORB_CLIP_ORB_SIZE: AtomicU32 = AtomicU32::new(FLOATING_ORB_SIZE);
-#[cfg(target_os = "windows")]
-static ORB_CLIP_DOCKED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static ORB_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(true);
-#[cfg(target_os = "windows")]
 static ORB_FRAME_REPAIR_REENTRY: AtomicBool = AtomicBool::new(false);
 
 fn strip_orb_native_frame_styles(style: isize, extended_style: isize) -> (isize, isize) {
@@ -2749,111 +2739,16 @@ fn strip_orb_native_frame_styles(style: isize, extended_style: isize) -> (isize,
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn create_docked_capsule_region(
-    width: i32,
-    height: i32,
-    docked_right: bool,
-) -> windows_sys::Win32::Graphics::Gdi::HRGN {
-    use windows_sys::Win32::Graphics::Gdi::{
-        CombineRgn, CreateEllipticRgn, CreateRectRgn, DeleteObject, RGN_OR,
-    };
-
-    // Flat against the screen edge, rounded on the free end — matches CSS
-    // `.is-docked` half-stadium so the docked edge cannot leak white.
-    let body = if docked_right {
-        CreateRectRgn(height / 2, 0, width, height)
-    } else {
-        CreateRectRgn(0, 0, width.saturating_sub(height / 2).max(1), height)
-    };
-    let cap = if docked_right {
-        CreateEllipticRgn(0, 0, height, height)
-    } else {
-        CreateEllipticRgn(width.saturating_sub(height), 0, width, height)
-    };
-    if body.is_null() || cap.is_null() {
-        if !body.is_null() {
-            DeleteObject(body as _);
-        }
-        if !cap.is_null() {
-            DeleteObject(cap as _);
-        }
-        return std::ptr::null_mut();
-    }
-    let combined = CreateRectRgn(0, 0, 0, 0);
-    if combined.is_null() || CombineRgn(combined, body, cap, RGN_OR) == 0 {
-        DeleteObject(body as _);
-        DeleteObject(cap as _);
-        if !combined.is_null() {
-            DeleteObject(combined as _);
-        }
-        return std::ptr::null_mut();
-    }
-    DeleteObject(body as _);
-    DeleteObject(cap as _);
-    combined
-}
-
-#[cfg(target_os = "windows")]
 unsafe fn apply_orb_clip_region_to_hwnd(
     hwnd: windows_sys::Win32::Foundation::HWND,
-    clip: bool,
+    _clip: bool,
 ) {
-    use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::Graphics::Gdi::{
-        CreateEllipticRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    use windows_sys::Win32::Graphics::Gdi::SetWindowRgn;
 
-    if !clip {
-        SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
-        return;
-    }
-
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-    if GetWindowRect(hwnd, &mut rect) == 0 {
-        return;
-    }
-    // SetWindowRgn coordinates are relative to the window's top-left, including
-    // any non-client area — use the outer size, not the client size.
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    if width <= 0 || height <= 0 {
-        return;
-    }
-
-    let collapsed = ORB_CLIP_COLLAPSED.load(Ordering::Relaxed);
-    let side_right = ORB_CLIP_SIDE_RIGHT.load(Ordering::Relaxed);
-    let region = if collapsed {
-        let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
-        let scale = if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 };
-        let orb_size = (ORB_CLIP_ORB_SIZE.load(Ordering::Relaxed) as f64 * scale).round() as i32;
-        let margin = (FLOATING_ORB_VISUAL_INSET * scale).round() as i32;
-        if orb_size <= 0 {
-            return;
-        }
-        let left = if side_right {
-            (width - margin - orb_size).max(0)
-        } else {
-            margin.min(width.saturating_sub(orb_size).max(0))
-        };
-        let top = margin.min(height.saturating_sub(orb_size).max(0));
-        CreateEllipticRgn(left, top, left + orb_size, top + orb_size)
-    } else if ORB_CLIP_DOCKED.load(Ordering::Relaxed) {
-        create_docked_capsule_region(width, height, side_right)
-    } else {
-        CreateRoundRectRgn(0, 0, width, height, height, height)
-    };
-    if region.is_null() {
-        return;
-    }
-    if SetWindowRgn(hwnd, region, 1) == 0 {
-        DeleteObject(region as _);
-    }
+    // Never shape-clip with a GDI region. CreateEllipticRgn / RoundRectRgn are
+    // binary masks, so the orb/capsule outline becomes a jagged 1-bit fringe.
+    // CSS border-radius / clip-path already antialias the visible shape.
+    SetWindowRgn(hwnd, std::ptr::null_mut(), 1);
 }
 
 #[cfg(target_os = "windows")]
@@ -2890,13 +2785,10 @@ unsafe extern "system" fn orb_window_proc(
     // frame and (on Win11) reinstate caption chrome. Re-strip + re-clip.
     match msg {
         WM_NCACTIVATE => {
-            ORB_WINDOW_FOCUSED.store(wparam != 0, Ordering::Relaxed);
             repair_orb_frame_and_clip(hwnd);
             return 1;
         }
         WM_ACTIVATE => {
-            let active = (wparam as usize & 0xffff) != 0;
-            ORB_WINDOW_FOCUSED.store(active, Ordering::Relaxed);
             repair_orb_frame_and_clip(hwnd);
         }
         WM_WINDOWPOSCHANGED => {
@@ -3059,22 +2951,6 @@ fn set_orb_window_region(
 }
 
 #[cfg(target_os = "windows")]
-fn orb_theme_surface_color(theme: &str) -> tauri::window::Color {
-    use tauri::window::Color;
-    // Keep in sync with --surface-rgb in App.css.
-    match theme {
-        "titanium" => Color(11, 23, 18, 255),
-        "spruce" => Color(12, 19, 32, 255),
-        "dusk" => Color(21, 15, 32, 255),
-        "abyss" => Color(26, 14, 16, 255),
-        "cashmere" => Color(19, 20, 21, 255),
-        "cinnabar" => Color(23, 15, 8, 255),
-        "cyber" => Color(11, 18, 22, 255),
-        _ => Color(20, 17, 9, 255),
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn set_orb_window_region_for_focus(
     window: &WebviewWindow,
     collapsed: bool,
@@ -3090,47 +2966,15 @@ fn set_orb_window_region_for_focus(
     remove_orb_native_frame(hwnd.0 as _);
     disable_floating_orb_dwm_border(hwnd);
     install_orb_window_message_hook(hwnd.0 as _);
+    let _ = collapsed;
+    let _ = side;
+    let _ = focused;
 
-    ORB_CLIP_COLLAPSED.store(collapsed, Ordering::Relaxed);
-    ORB_CLIP_SIDE_RIGHT.store(side == "right", Ordering::Relaxed);
-    ORB_CLIP_ORB_SIZE.store(orb_size_for_window(window), Ordering::Relaxed);
-    ORB_WINDOW_FOCUSED.store(focused, Ordering::Relaxed);
-    let app_state = window.app_handle().state::<AppState>();
-    let docked = window
-        .outer_position()
-        .ok()
-        .and_then(|position| {
-            orb_is_near_edge(
-                window,
-                &app_state,
-                SavedPosition {
-                    x: position.x,
-                    y: position.y,
-                },
-            )
-            .ok()
-        })
-        .unwrap_or(false);
-    ORB_CLIP_DOCKED.store(docked, Ordering::Relaxed);
-
-    // Always shape-clip. Clearing the region on focus exposes the rectangular
-    // window frame (and any ghost titlebar) — that is the docked "✕ strip" bug.
-    // When unfocused, also force an opaque surface-colored WebView backing so
-    // transparent CSS padding cannot show WebView2's default white fill.
-    if focused {
-        let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
-    } else {
-        let theme = window
-            .app_handle()
-            .state::<AppState>()
-            .data
-            .lock()
-            .ok()
-            .map(|data| data.theme.clone())
-            .unwrap_or_else(|| "obsidian".to_owned());
-        let _ = window.set_background_color(Some(orb_theme_surface_color(&theme)));
-    }
-    unsafe { apply_orb_clip_region_to_hwnd(hwnd.0 as _, true) };
+    // Keep WebView2 fully transparent so CSS can antialias the capsule/circle
+    // against the desktop. An opaque controller color fills the rectangular
+    // HWND and reads as a hard box around the rounded CSS outline.
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+    unsafe { apply_orb_clip_region_to_hwnd(hwnd.0 as _, false) };
     Ok(())
 }
 
