@@ -1,5 +1,5 @@
 import { type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { animated, useSpring, useTransition } from "@react-spring/web";
+import { animated, easings, useSpring, useTransition } from "@react-spring/web";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { cursorPosition, getCurrentWindow } from "@tauri-apps/api/window";
@@ -70,8 +70,26 @@ type CursorTokenUsageStats = {
   eventsScanned: number;
   cacheAvailable: boolean;
   syncPerformed: boolean;
+  syncInProgress: boolean;
   syncError: string | null;
   updatedAt: number | null;
+};
+type ActiveSession = {
+  id: string;
+  label: string;
+  model: string | null;
+  status: "running" | "recent" | string;
+  cwd: string | null;
+  startedAt: number;
+  lastActivityAt: number;
+  outputTokens: number;
+  openTurns: number;
+};
+type ActiveSessionsStats = {
+  currentModel: string | null;
+  activeSessions: ActiveSession[];
+  available: boolean;
+  updatedAt: number;
 };
 type MainQuotaUpdate =
   | { platform: "codex"; snapshot: UsageSnapshot }
@@ -94,7 +112,46 @@ type FloatingSettings = {
   theme: "obsidian" | "titanium" | "spruce" | "dusk" | "abyss" | "cashmere" | "cinnabar" | "cyber";
   proxyMode: "system" | "none" | "custom";
   proxyAddress: string;
+  taskbarStatusVisible: boolean;
   dataDirectory: string;
+};
+type TaskbarStatusPayload = {
+  title: string;
+  tooltip: string;
+  platformLabel: string;
+  primaryName: string;
+  primaryPercent: number | null;
+  primaryReset: string;
+  secondaryName: string;
+  secondaryPercent: number | null;
+  secondaryReset: string;
+  quotaLine: string;
+  tokenLine: string;
+  sessionLine: string;
+  modelLine: string;
+  sessionItems: string[];
+  usedPercent: number | null;
+};
+type DashboardSceneFrame = {
+  platform: Platform;
+  usage: UsageSnapshot | null;
+  quotaLoading: boolean;
+  quotaError: string | null;
+  startingQuotaRead: boolean;
+  tokenStats: TokenUsageStats | null;
+  tokenLoading: boolean;
+  tokenError: string | null;
+  sessionStats: ActiveSessionsStats | null;
+  sessionLoading: boolean;
+  sessionError: string | null;
+  displayMode: FloatingSettings["displayMode"];
+  primary: RateWindow | null | undefined;
+  secondary: RateWindow | null | undefined;
+  primaryLabel: string;
+  secondaryLabel: string;
+  primaryOppositeMode: FloatingSettings["displayMode"];
+  primaryOppositeMetric: number;
+  secondaryMetric: number;
 };
 type OrbDragResult = { moved: boolean; atEdge: boolean; side: "left" | "right" };
 type OrbPointerPress = {
@@ -104,6 +161,9 @@ type OrbPointerPress = {
   cursorStart: ReturnType<typeof cursorPosition>;
 };
 
+const VIEW_LEAVE_MS = 120;
+const VIEW_ENTER_MS = 160;
+const SESSION_REFRESH_MS = 5_000;
 const MIN_ORB_WAVE_AMPLITUDE = 0.5;
 const MAX_ORB_WAVE_AMPLITUDE = 4;
 const MIN_ORB_SIZE = 48;
@@ -129,7 +189,7 @@ function usePageVisibility() {
   return visible;
 }
 
-function PrettyScroller({ children, active = true }: { children: ReactNode; active?: boolean }) {
+function PrettyScroller({ children, active = true, className = "" }: { children: ReactNode; active?: boolean; className?: string }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [thumb, setThumb] = useState({ top: 0, height: 40, visible: false });
 
@@ -170,7 +230,7 @@ function PrettyScroller({ children, active = true }: { children: ReactNode; acti
   }, [active, update]);
 
   return (
-    <div className="pretty-scroll">
+    <div className={`pretty-scroll ${className} ${thumb.visible ? "is-scrollable" : ""}`.trim()}>
       <div ref={viewportRef} className="pretty-scroll__viewport" onScroll={update}>
         {children}
       </div>
@@ -350,6 +410,7 @@ const defaultFloatingSettings: FloatingSettings = {
   theme: "obsidian",
   proxyMode: "system",
   proxyAddress: "",
+  taskbarStatusVisible: true,
   dataDirectory: "data",
 };
 
@@ -412,6 +473,40 @@ async function refreshPlatformTokenData(platform: Platform): Promise<TokenUsageS
   }
   return invoke<TokenUsageStats>("get_token_usage_stats", { todayStart, tomorrowStart });
 }
+
+async function loadCachedPlatformSessions(platform: Platform): Promise<ActiveSessionsStats | null> {
+  if (platform === "cursor") {
+    return invoke<ActiveSessionsStats | null>("get_cached_cursor_active_sessions");
+  }
+  return invoke<ActiveSessionsStats | null>("get_cached_active_sessions");
+}
+
+async function refreshPlatformSessions(platform: Platform): Promise<ActiveSessionsStats> {
+  if (platform === "cursor") {
+    return invoke<ActiveSessionsStats>("get_cursor_active_sessions");
+  }
+  return invoke<ActiveSessionsStats>("get_active_sessions");
+}
+
+const demoSessionStats: ActiveSessionsStats = {
+  currentModel: "gpt-demo",
+  activeSessions: Array.from({ length: 3 }, (_, index) => {
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      id: `demo-session-${index + 1}`,
+      label: `项目 ${index + 1}`,
+      model: index % 2 === 0 ? "gpt-demo" : "claude-demo",
+      status: "running",
+      cwd: `D:/code/demo-project-${index + 1}`,
+      startedAt: now - (index + 1) * 120,
+      lastActivityAt: now - index * 8,
+      outputTokens: 800 + index * 140,
+      openTurns: 1,
+    };
+  }),
+  available: true,
+  updatedAt: Math.floor(Date.now() / 1000),
+};
 
 const themes: { id: FloatingSettings["theme"]; label: string; name: string; colors: string[] }[] = [
   { id: "obsidian", label: "曜石", name: "曜石紫罗兰", colors: ["#121113", "#1A191B", "#232225", "#3C393F", "#EEEEF0", "#B5B2BC", "#BAA7FF", "#D0C3FF", "#323035", "#BAA7FF"] },
@@ -505,6 +600,98 @@ function formatTokenCount(value: number) {
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(value);
 }
 
+function formatCompactTokens(value: number) {
+  if (value >= 100_000_000) return `${(value / 100_000_000).toFixed(value >= 1_000_000_000 ? 1 : 0)}亿`;
+  if (value >= 10_000) return `${(value / 10_000).toFixed(value >= 100_000 ? 0 : 1)}万`;
+  return formatTokenCount(value);
+}
+
+function buildTaskbarStatus(input: {
+  platform: Platform;
+  displayMode: FloatingSettings["displayMode"];
+  usage: UsageSnapshot | null;
+  primaryLabel: string;
+  secondaryLabel: string;
+  tokenStats: TokenUsageStats | null;
+  sessionStats: ActiveSessionsStats | null;
+  quotaError: string | null;
+  nowMs?: number;
+}): TaskbarStatusPayload {
+  const platformLabel = input.platform === "cursor" ? "Cursor" : "Codex";
+  const modeLabel = metricLabel(input.displayMode);
+  const nowMs = input.nowMs ?? Date.now();
+  const primary = input.usage?.primary;
+  const secondary = input.usage?.secondary;
+  const primaryMetric = primary ? Math.round(metricValue(primary.usedPercent, input.displayMode)) : null;
+  const secondaryMetric = secondary ? Math.round(metricValue(secondary.usedPercent, input.displayMode)) : null;
+  const usedPercent = primary?.usedPercent ?? secondary?.usedPercent ?? null;
+  const remainingPrefix = input.displayMode === "available" ? "剩余" : "已用";
+
+  const quotaLine = input.quotaError && !input.usage
+    ? "额度：同步失败"
+    : primaryMetric == null && secondaryMetric == null
+      ? "额度：暂无数据"
+      : [
+          primaryMetric == null ? null : `${input.primaryLabel}${modeLabel}${primaryMetric}%`,
+          secondaryMetric == null ? null : `${input.secondaryLabel}${modeLabel}${secondaryMetric}%`,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+
+  const tokenLine = !input.tokenStats || !input.tokenStats.available
+    ? "Token：暂无数据"
+    : `Token：今日 ${formatCompactTokens(input.tokenStats.todayTokens)} · 累计 ${formatCompactTokens(input.tokenStats.totalTokens)}`;
+
+  const sessions = input.sessionStats?.activeSessions ?? [];
+  const sessionModel = input.sessionStats?.currentModel;
+  const sessionLine = !input.sessionStats
+    ? "会话：读取中"
+    : sessions.length === 0
+      ? "会话：无进行中"
+      : `会话：${sessions.length} 个进行中`;
+  const modelLine = sessionModel ? `模型：${sessionModel}` : sessions.length > 0 ? "模型：—" : "模型：无";
+  const sessionItems = sessions.slice(0, 3).map((session) => {
+    const ageMins = Math.max(0, Math.round((nowMs / 1000 - session.lastActivityAt) / 60));
+    const age = ageMins >= 60 ? `${Math.floor(ageMins / 60)}小时 ${ageMins % 60}分` : `${ageMins}分`;
+    return `${session.label}${session.model ? ` · ${session.model}` : ""} · ${age}`;
+  });
+
+  const titleQuota = primaryMetric != null
+    ? `${modeLabel}${primaryMetric}%`
+    : secondaryMetric != null
+      ? `${modeLabel}${secondaryMetric}%`
+      : "暂无额度";
+
+  const tooltip = [
+    `AI Usage Meter · ${platformLabel}${input.usage?.email ? ` · ${input.usage.email}` : ""}`,
+    quotaLine,
+    tokenLine,
+    sessionLine,
+  ].join("\r\n");
+
+  return {
+    title: `${platformLabel} ${titleQuota}`,
+    tooltip,
+    platformLabel,
+    primaryName: input.primaryLabel,
+    primaryPercent: primaryMetric,
+    primaryReset: primary
+      ? `${formatRemaining(primary.resetsAt, nowMs)} · ${remainingPrefix} ${primaryMetric ?? 0}%`
+      : "暂无额度",
+    secondaryName: input.secondaryLabel,
+    secondaryPercent: secondaryMetric,
+    secondaryReset: secondary
+      ? `${formatRemaining(secondary.resetsAt, nowMs)} · ${remainingPrefix} ${secondaryMetric ?? 0}%`
+      : "暂无额度",
+    quotaLine,
+    tokenLine,
+    sessionLine,
+    modelLine,
+    sessionItems,
+    usedPercent,
+  };
+}
+
 function planLabel(plan: string | null) {
   if (!plan || plan === "unknown") return "ChatGPT 账户";
   return `${plan.charAt(0).toUpperCase()}${plan.slice(1)} 计划`;
@@ -523,14 +710,19 @@ function oppositeDisplayMode(mode: FloatingSettings["displayMode"]): FloatingSet
 }
 
 function Gauge({ usedPercent, mode, compact = false }: { usedPercent: number; mode: FloatingSettings["displayMode"]; compact?: boolean }) {
+  const [canAnimate, setCanAnimate] = useState(false);
   const safeValue = metricValue(usedPercent, mode);
   const radius = compact ? 54 : 72;
   const circumference = 2 * Math.PI * radius;
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setCanAnimate(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
   return (
     <div className={`gauge ${compact ? "gauge--compact" : ""}`} aria-label={`${metricLabel(mode)} ${Math.round(safeValue)}%`}>
       <svg viewBox="0 0 180 180" role="img">
         <circle className="gauge__track" cx="90" cy="90" r={radius} />
-        <circle className="gauge__value" cx="90" cy="90" r={radius} style={{ strokeDasharray: circumference, strokeDashoffset: circumference * (1 - safeValue / 100) }} />
+        <circle className="gauge__value" cx="90" cy="90" r={radius} style={{ strokeDasharray: circumference, strokeDashoffset: circumference * (1 - safeValue / 100), transition: canAnimate ? undefined : "none" }} />
       </svg>
       <div className="gauge__number"><strong>{Math.round(safeValue)}</strong><span>% {metricLabel(mode)}</span></div>
     </div>
@@ -692,6 +884,7 @@ function FloatingApp() {
     const clockTimer = window.setInterval(() => setNowMs(Date.now()), 1_000);
     return () => window.clearInterval(clockTimer);
   }, [pageIsVisible, settings.visible]);
+
 
   useEffect(() => {
     if (!pageIsVisible || !("__TAURI_INTERNALS__" in window)) return;
@@ -997,8 +1190,8 @@ function FloatingApp() {
         >
           <SpringLiquid level={primaryWater} speed={settings.orbWaveSpeed} amplitude={settings.orbWaveAmplitude} dragging={orbDraggingVisual} running={settings.visible && settings.style === "orb" && pageIsVisible} />
           <span className={`orb-core ${Math.round(primaryMetric) >= 100 ? "is-three-digit" : ""}`} aria-label={`${Math.round(primaryMetric)}%`}>
-            <strong>{Math.round(primaryMetric)}</strong><small>%</small>
-          </span>
+              <strong>{Math.round(primaryMetric)}</strong><small>%</small>
+            </span>
         </button>
       </main>
     );
@@ -1037,6 +1230,7 @@ function FloatingApp() {
           <b>{usage?.secondary ? formatRemaining(usage.secondary.resetsAt, nowMs) : "--"}</b>
         </div>
       </section>
+
 
       <footer className="floating-footer" onMouseDown={(event) => startNativeDrag(event, !settings.pinned)}>
         <span className={error ? "is-error" : ""}><i /> {error ? "同步失败" : loading ? "同步中" : "额度可用"}</span>
@@ -1112,10 +1306,124 @@ function TokenOverview({
   );
 }
 
+function SessionOverview({
+  stats,
+  loading,
+  error,
+  previewOnly,
+  onRefresh,
+  active = true,
+  platformLabel,
+}: {
+  stats: ActiveSessionsStats | null;
+  loading: boolean;
+  error: string | null;
+  previewOnly: boolean;
+  onRefresh: () => void;
+  active?: boolean;
+  platformLabel: string;
+}) {
+  const [nowMs, setNowMs] = useState(Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+  const updatedAt = stats?.updatedAt
+    ? new Date(stats.updatedAt * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+    : "尚未读取";
+  const sessions = stats?.activeSessions ?? [];
+  const model = stats?.currentModel || "—";
+
+  return (
+    <section className="speed-view session-view" id={active ? "sessions-view" : undefined} role="tabpanel" aria-labelledby="main-view-tab-sessions">
+      <header className="token-view__heading">
+        <div>
+          <span className="eyebrow">ACTIVE SESSIONS / 03</span>
+          <h1 id="sessions-view-title">会话视角</h1>
+          <p>展示 {platformLabel} 当前进行中的会话，每 5 秒刷新。</p>
+        </div>
+        <button className="token-refresh" onClick={onRefresh} disabled={loading}>
+          <svg className={loading ? "is-spinning" : ""} viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 8.1A7 7 0 0 1 18.6 7M17.9 15.9A7 7 0 0 1 5.4 17" /></svg>
+          {loading ? "正在更新…" : "刷新会话"}
+        </button>
+      </header>
+
+      <div className="session-hero" aria-live="polite" aria-busy={loading}>
+        <article className="speed-stat-card">
+          <span>进行中</span>
+          <strong>{sessions.length}</strong>
+          <small>ACTIVE SESSIONS</small>
+        </article>
+        <article className="speed-model-card">
+          <span className="eyebrow">ACTIVE MODEL</span>
+          <strong title={model}>{model}</strong>
+          <small>{stats?.currentModel ? "近期会话正在使用" : "暂无模型记录"}</small>
+        </article>
+        <article className="speed-stat-card">
+          <span>最近读取</span>
+          <strong>{updatedAt}</strong>
+          <small>LAST SCAN</small>
+        </article>
+      </div>
+
+      <section className="speed-session-panel">
+        <div className="card-heading">
+          <div><span className="eyebrow">ACTIVE SESSIONS</span><h2>当前进行的会话</h2></div>
+          <span className="speed-session-count">{sessions.length} 个</span>
+        </div>
+        {sessions.length ? (
+          <PrettyScroller active={active} className="pretty-scroll--sessions">
+            <ul className="speed-session-list">
+              {sessions.map((session) => (
+                <li key={session.id} className={`speed-session-item ${session.status === "running" ? "is-running" : ""}`}>
+                  <div className="speed-session-item__main">
+                    <strong title={session.cwd || session.label}>{session.label}</strong>
+                    <span title={session.model || undefined}>
+                      {session.model && session.model.toLowerCase() !== "default" ? session.model : "模型未知"}
+                    </span>
+                  </div>
+                  <div className="speed-session-item__meta">
+                    <b>{session.status === "running" ? "进行中" : "最近"}</b>
+                    <span>进行中 · {session.openTurns || 1} 回合</span>
+                    <span>{formatSessionActivity(session.lastActivityAt, nowMs)}</span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </PrettyScroller>
+        ) : (
+          <div className="speed-session-empty">当前没有进行中的会话</div>
+        )}
+      </section>
+
+      <div className="token-data-strip">
+        <div className="token-data-strip__source"><span className="token-data-strip__mark">↗</span><div><strong>会话账本</strong><span>仅展示近期仍有输出的会话</span></div></div>
+        <div className="token-data-strip__meta"><span>会话数</span><strong>{sessions.length}</strong></div>
+        <div className="token-data-strip__meta"><span>最近读取</span><strong>{updatedAt}</strong></div>
+      </div>
+
+      {previewOnly && <p className="token-status-note">会话统计仅在桌面版中读取；浏览器预览显示演示数据。</p>}
+      {!previewOnly && error && <p className="token-status-note token-status-note--error">读取失败：{error}</p>}
+      {!previewOnly && !loading && stats?.available === false && <p className="token-status-note">当前暂无可统计的会话数据，请确认平台已登录并产生输出后再刷新。</p>}
+      <p className="token-view__footnote">仅展示近 90 秒仍有输出的会话；超过 5 条可滚动。会话列表每 5 秒刷新并写入本机缓存。</p>
+    </section>
+  );
+}
+
+function formatSessionActivity(timestamp: number, nowMs: number) {
+  const elapsedSecs = Math.max(0, Math.floor((nowMs - timestamp * 1000) / 1000));
+  if (elapsedSecs < 5) return "刚刚活跃";
+  if (elapsedSecs < 60) return `${elapsedSecs} 秒前`;
+  if (elapsedSecs < 3600) return `${Math.floor(elapsedSecs / 60)} 分钟前`;
+  return new Date(timestamp * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
 function DashboardApp() {
   const pageIsVisible = usePageVisibility();
   const isDesktopApp = "__TAURI_INTERNALS__" in window;
-  const [mainView, setMainView] = useState<"quota" | "tokens">("quota");
+  const [mainView, setMainView] = useState<"quota" | "tokens" | "sessions">("quota");
   const [activePlatform, setActivePlatform] = useState<Platform>(() => {
     try {
       const saved = window.localStorage.getItem("ai-usage-meter-platform") ?? window.localStorage.getItem("quota-meter-platform");
@@ -1153,6 +1461,10 @@ function DashboardApp() {
   const [cursorTokenStatsLoading, setCursorTokenStatsLoading] = useState(isDesktopApp);
   const [cursorQuotaError, setCursorQuotaError] = useState<string | null>(null);
   const [cursorTokenStatsError, setCursorTokenStatsError] = useState<string | null>(null);
+  const [sessionStats, setSessionStats] = useState<ActiveSessionsStats | null>(() => (isDesktopApp ? null : demoSessionStats));
+  const [sessionStatsLoading, setSessionStatsLoading] = useState(isDesktopApp);
+  const [sessionStatsError, setSessionStatsError] = useState<string | null>(null);
+  const sessionScanInFlight = useRef(false);
   const startupSyncStartedRef = useRef(!isDesktopApp);
   const observedPlatformRef = useRef<Platform | null>(null);
   const observedVisibilityRef = useRef<boolean | null>(null);
@@ -1171,12 +1483,14 @@ function DashboardApp() {
   const settingsWrapRef = useRef<HTMLDivElement>(null);
   activePlatformRef.current = activePlatform;
   const sceneKey = `${activePlatform}:${mainView}`;
+  const sceneSnapshotsRef = useRef(new Map<string, DashboardSceneFrame>());
   const sceneTransition = useTransition(sceneKey, {
-    keys: sceneKey,
-    from: { opacity: 0, transform: "translate3d(0, 18px, 0) scale(0.975)" },
-    enter: { opacity: 1, transform: "translate3d(0, 0px, 0) scale(1)" },
-    leave: { opacity: 0, transform: "translate3d(0, -14px, 0) scale(0.99)" },
-    config: { tension: 280, friction: 32 },
+    from: { opacity: 0, transform: "translate3d(0, 10px, 0)" },
+    enter: { opacity: 1, transform: "translate3d(0, 0px, 0)", config: { duration: VIEW_ENTER_MS, easing: easings.easeOutCubic } },
+    leave: { opacity: 0, transform: "translate3d(0, -6px, 0)", config: { duration: VIEW_LEAVE_MS, easing: easings.easeInCubic } },
+    exitBeforeEnter: true,
+    immediate: false,
+    config: { duration: VIEW_ENTER_MS, easing: easings.easeOutCubic },
   });
 
   useEffect(() => {
@@ -1329,6 +1643,36 @@ function DashboardApp() {
     else await refreshTokenStats(queueIfBusy);
   }, [refreshCursorTokenStats, refreshTokenStats]);
 
+  const refreshActiveSessionStats = useCallback(async (showLoading = true, preferCacheFirst = false) => {
+    if (!("__TAURI_INTERNALS__" in window)) {
+      setSessionStats(demoSessionStats);
+      setSessionStatsError(null);
+      setSessionStatsLoading(false);
+      return;
+    }
+    if (sessionScanInFlight.current) return;
+    sessionScanInFlight.current = true;
+    if (showLoading) {
+      setSessionStatsLoading(true);
+      setSessionStatsError(null);
+    }
+    try {
+      if (preferCacheFirst) {
+        const cached = await loadCachedPlatformSessions(activePlatformRef.current);
+        if (cached) {
+          setSessionStats(cached);
+          if (showLoading) setSessionStatsLoading(false);
+        }
+      }
+      setSessionStats(await refreshPlatformSessions(activePlatformRef.current));
+    } catch (reason) {
+      setSessionStatsError(isAppStateNotReadyError(reason) ? null : String(reason));
+    } finally {
+      sessionScanInFlight.current = false;
+      if (showLoading) setSessionStatsLoading(false);
+    }
+  }, []);
+
   const refreshCursorOverview = useCallback(async (force = false, includeTokenStats = true) => {
     if (!("__TAURI_INTERNALS__" in window) || cursorRefreshInFlight.current) return;
     cursorRefreshInFlight.current = true;
@@ -1456,6 +1800,15 @@ function DashboardApp() {
   }, [floatingSettingsLoaded, isDesktopApp, mainView, pageIsVisible, refreshActiveTokenStats, startupSyncStarted]);
 
   useEffect(() => {
+    // Keep sessions fresh for the taskbar tooltip even when the sessions tab is not open.
+    if (!floatingSettingsLoaded || !pageIsVisible) return;
+    if (isDesktopApp && !startupSyncStarted) return;
+    void refreshActiveSessionStats(mainView === "sessions", true);
+    const refreshTimer = window.setInterval(() => void refreshActiveSessionStats(false, false), SESSION_REFRESH_MS);
+    return () => window.clearInterval(refreshTimer);
+  }, [activePlatform, floatingSettingsLoaded, isDesktopApp, mainView, pageIsVisible, refreshActiveSessionStats, startupSyncStarted]);
+
+  useEffect(() => {
     if (isDesktopApp && (!floatingSettingsLoaded || !startupSyncStarted)) return;
     if (activePlatform !== "codex") return;
     const refreshTimer = window.setInterval(() => void refresh(false, true), floatingSettings.syncIntervalSecs * 1_000);
@@ -1478,6 +1831,18 @@ function DashboardApp() {
     let unlisten: (() => void) | undefined;
     void listen("floating-quota-refresh-requested", () => quotaOnlyRefreshRef.current())
       .then((stop) => { unlisten = stop; });
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    void listen<CursorTokenUsageStats>("cursor-token-stats-updated", (event) => {
+      setCursorTokenStats(event.payload);
+      if (event.payload.syncError) setCursorTokenStatsError(event.payload.syncError);
+      else setCursorTokenStatsError(null);
+      setCursorTokenStatsLoading(false);
+    }).then((stop) => { unlisten = stop; });
     return () => unlisten?.();
   }, []);
 
@@ -1560,6 +1925,22 @@ function DashboardApp() {
       const visible = await invoke<boolean>("set_floating_window", { visible: !floatingSettings.visible });
       setFloatingSettings((value) => ({ ...value, visible }));
     } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const toggleTaskbarStatus = async () => {
+    const next = !floatingSettings.taskbarStatusVisible;
+    if (!("__TAURI_INTERNALS__" in window)) {
+      setFloatingSettings((value) => ({ ...value, taskbarStatusVisible: next }));
+      return;
+    }
+    setFloatingSettings((value) => ({ ...value, taskbarStatusVisible: next }));
+    try {
+      const visible = await invoke<boolean>("set_taskbar_status_visible", { visible: next });
+      setFloatingSettings((value) => ({ ...value, taskbarStatusVisible: visible }));
+    } catch (reason) {
+      setFloatingSettings((value) => ({ ...value, taskbarStatusVisible: !next }));
       setError(String(reason));
     }
   };
@@ -1718,6 +2099,7 @@ function DashboardApp() {
     } catch (reason) { setError(String(reason)); }
   };
 
+
   const displayedUsage = activePlatform === "cursor"
     ? cursorQuota?.status === "connected" ? cursorQuotaAsUsage(cursorQuota) : null
     : usage;
@@ -1738,7 +2120,9 @@ function DashboardApp() {
   const displayedTokenError = activePlatform === "cursor"
     ? cursorTokenStatsError || cursorTokenStats?.syncError || null
     : tokenStatsError;
-  const displayedTokenLoading = activePlatform === "cursor" ? cursorTokenStatsLoading : tokenStatsLoading;
+  const displayedTokenLoading = activePlatform === "cursor"
+    ? cursorTokenStatsLoading || !!cursorTokenStats?.syncInProgress
+    : tokenStatsLoading;
   const updatedAt = useMemo(() => displayedUsage ? new Date(displayedUsage.fetchedAt * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : "尚未同步", [displayedUsage]);
   const primary = displayedUsage?.primary;
   const secondary = displayedUsage?.secondary;
@@ -1750,6 +2134,55 @@ function DashboardApp() {
   const refreshActiveQuota = () => activePlatform === "cursor" ? void refreshCursorOverview(true, false) : void refresh(true, false);
   const startingQuotaRead = isDesktopApp && (!floatingSettingsLoaded || (displayedQuotaLoading && !displayedUsage));
   quotaOnlyRefreshRef.current = refreshActiveQuota;
+  const liveScene: DashboardSceneFrame = {
+    platform: activePlatform,
+    usage: displayedUsage,
+    quotaLoading: displayedQuotaLoading,
+    quotaError: displayedQuotaError,
+    startingQuotaRead,
+    tokenStats: displayedTokenStats,
+    tokenLoading: displayedTokenLoading || (isDesktopApp && !floatingSettingsLoaded),
+    tokenError: displayedTokenError,
+    sessionStats,
+    sessionLoading: sessionStatsLoading || (isDesktopApp && !floatingSettingsLoaded),
+    sessionError: sessionStatsError,
+    displayMode: floatingSettings.displayMode,
+    primary,
+    secondary,
+    primaryLabel,
+    secondaryLabel,
+    primaryOppositeMode,
+    primaryOppositeMetric,
+    secondaryMetric,
+  };
+  sceneSnapshotsRef.current.set(sceneKey, liveScene);
+
+  useEffect(() => {
+    if (!isDesktopApp || !floatingSettingsLoaded) return;
+    const status = buildTaskbarStatus({
+      platform: activePlatform,
+      displayMode: floatingSettings.displayMode,
+      usage: displayedUsage,
+      primaryLabel,
+      secondaryLabel,
+      tokenStats: displayedTokenStats,
+      sessionStats,
+      quotaError: displayedQuotaError,
+      nowMs: Date.now(),
+    });
+    void invoke("update_taskbar_status", { status }).catch(() => undefined);
+  }, [
+    activePlatform,
+    displayedQuotaError,
+    displayedTokenStats,
+    displayedUsage,
+    floatingSettings.displayMode,
+    floatingSettingsLoaded,
+    isDesktopApp,
+    primaryLabel,
+    secondaryLabel,
+    sessionStats,
+  ]);
 
   return (
     <main className={`app-shell ${sidebarExpanded ? "" : "is-sidebar-collapsed"}`}>
@@ -1771,21 +2204,21 @@ function DashboardApp() {
         <nav className="platform-list" aria-label="选择统计平台">
           <button className={`platform-switch ${activePlatform === "codex" ? "is-active" : ""}`} onClick={() => void selectPlatform("codex")} disabled={isDesktopApp && !floatingSettingsLoaded} aria-label="Codex 平台" title="Codex" aria-pressed={activePlatform === "codex"}>
             <span className="platform-switch__mark platform-switch__mark--codex"><CodexPlatformIcon /></span>
-            <span className="platform-switch__copy"><strong>Codex</strong><small>额度 · Token</small></span>
+            <span className="platform-switch__copy"><strong>Codex</strong><small>额度 · Token · 会话</small></span>
             <i />
           </button>
           <button className={`platform-switch platform-switch--cursor ${activePlatform === "cursor" ? "is-active" : ""}`} onClick={() => void selectPlatform("cursor")} disabled={isDesktopApp && !floatingSettingsLoaded} aria-label="Cursor 平台" title="Cursor" aria-pressed={activePlatform === "cursor"}>
             <span className="platform-switch__mark platform-switch__mark--cursor"><CursorPlatformIcon /></span>
-            <span className="platform-switch__copy"><strong>Cursor</strong><small>额度 · Token</small></span>
+            <span className="platform-switch__copy"><strong>Cursor</strong><small>额度 · Token · 会话</small></span>
             <i />
           </button>
         </nav>
-        <div className="platform-sidebar__footer"><span className="platform-sidebar__pulse" /><strong>单平台显示</strong><small>当前只展示所选平台<br />的额度与 Token 视角</small></div>
+        <div className="platform-sidebar__footer"><span className="platform-sidebar__pulse" /><strong>单平台显示</strong><small>当前只展示所选平台<br />的额度、Token 与会话</small></div>
       </aside>
       <section className="dashboard-panel">
       <div className="ambient ambient--one" /><div className="ambient ambient--two" />
       <header className="topbar">
-        <div className="brand"><div className="brand__mark"><span /></div><div><div className="brand__name">AI USAGE METER</div><div className="brand__sub">{activePlatform === "codex" ? "Codex · 额度与 Token" : "Cursor · 额度与 Token"}</div></div></div>
+        <div className="brand"><div className="brand__mark"><span /></div><div><div className="brand__name">AI USAGE METER</div><div className="brand__sub">{activePlatform === "codex" ? "Codex · 额度 / Token / 会话" : "Cursor · 额度 / Token / 会话"}</div></div></div>
         <nav className="main-view-tabs" role="tablist" aria-label="主界面视角">
           <button id="main-view-tab-quota" className={mainView === "quota" ? "is-active" : ""} role="tab" aria-controls="quota-view" aria-selected={mainView === "quota"} onClick={() => setMainView("quota")}>
             <span>01</span><strong>额度视角</strong>
@@ -1793,10 +2226,17 @@ function DashboardApp() {
           <button id="main-view-tab-tokens" className={mainView === "tokens" ? "is-active" : ""} role="tab" aria-controls="token-view" aria-selected={mainView === "tokens"} onClick={() => setMainView("tokens")}>
             <span>02</span><strong>Token 视角</strong>
           </button>
+          <button id="main-view-tab-sessions" className={mainView === "sessions" ? "is-active" : ""} role="tab" aria-controls="sessions-view" aria-selected={mainView === "sessions"} onClick={() => setMainView("sessions")}>
+            <span>03</span><strong>会话视角</strong>
+          </button>
         </nav>
         <div className="topbar__actions">
           {activePlatform === "codex" && demoMode && <span className="demo-pill">浏览器演示</span>}
           <div className="sync-state"><i className={displayedQuotaError ? "is-error" : ""} /><span>{!floatingSettingsLoaded && isDesktopApp ? "正在准备本机服务" : displayedQuotaLoading ? "正在同步" : displayedQuotaError ? "同步失败" : `更新于 ${updatedAt}`}</span></div>
+          <button className={`floating-toggle floating-toggle--taskbar ${floatingSettings.taskbarStatusVisible ? "is-active" : ""}`} onClick={() => void toggleTaskbarStatus()} disabled={isDesktopApp && !floatingSettingsLoaded} aria-pressed={floatingSettings.taskbarStatusVisible} aria-label={floatingSettings.taskbarStatusVisible ? "关闭托盘状态" : "开启托盘状态"} title={floatingSettings.taskbarStatusVisible ? "关闭托盘状态" : "开启托盘状态"}>
+            <span className="toggle-track"><i /></span>
+            <span className="sidebar-action-label">托盘</span>
+          </button>
           <button className={`floating-toggle ${floatingSettings.visible ? "is-active" : ""}`} onClick={toggleFloatingWindow} disabled={isDesktopApp && !floatingSettingsLoaded} aria-pressed={floatingSettings.visible} aria-label={floatingSettings.visible ? "关闭悬浮窗" : "开启悬浮窗"} title={floatingSettings.visible ? "关闭悬浮窗" : "开启悬浮窗"}>
             <span className="toggle-track"><i /></span>
             <span className="sidebar-action-label">悬浮窗</span>
@@ -1814,6 +2254,15 @@ function DashboardApp() {
                   <button className={floatingSettings.displayMode === "available" ? "is-active" : ""} onClick={() => void setDisplayMode("available")}>显示可用</button>
                   <button className={floatingSettings.displayMode === "used" ? "is-active" : ""} onClick={() => void setDisplayMode("used")}>显示已使用</button>
                 </div>
+              </div>
+              <div className="settings-block settings-block--inline">
+                <div>
+                  <span className="settings-label">托盘状态</span>
+                  <small>{floatingSettings.taskbarStatusVisible ? "悬停托盘图标显示额度摘要" : "已关闭托盘状态弹层"}</small>
+                </div>
+                <button className={`compact-action ${floatingSettings.taskbarStatusVisible ? "is-active" : ""}`} onClick={() => void toggleTaskbarStatus()} disabled={isDesktopApp && !floatingSettingsLoaded}>
+                  {floatingSettings.taskbarStatusVisible ? "已开启" : "已关闭"}
+                </button>
               </div>
               <div className="settings-block settings-block--interval">
                 <label htmlFor="sync-interval" className="settings-interval-label">
@@ -1927,59 +2376,74 @@ function DashboardApp() {
       </header>
 
       <div className="view-stage">
-      {sceneTransition((style, key) => (
+      {sceneTransition((style, key) => {
+        const pane = sceneSnapshotsRef.current.get(key) ?? liveScene;
+        return (
         <animated.div className="view-pane" style={style} aria-hidden={key !== sceneKey}>
+          <PrettyScroller active={key === sceneKey} className="pretty-scroll--view">
           {key.endsWith(":tokens") ? (
         <TokenOverview
-          stats={displayedTokenStats}
-          loading={displayedTokenLoading || (isDesktopApp && !floatingSettingsLoaded)}
-          error={displayedTokenError}
+          stats={pane.tokenStats}
+          loading={pane.tokenLoading}
+          error={pane.tokenError}
           previewOnly={!("__TAURI_INTERNALS__" in window)}
           onRefresh={refreshActiveTokenStats}
           active={key === sceneKey}
         />
+          ) : key.endsWith(":sessions") ? (
+        <SessionOverview
+          stats={pane.sessionStats}
+          loading={pane.sessionLoading}
+          error={pane.sessionError}
+          previewOnly={!("__TAURI_INTERNALS__" in window)}
+          onRefresh={() => void refreshActiveSessionStats()}
+          active={key === sceneKey}
+          platformLabel={pane.platform === "cursor" ? "Cursor" : "Codex"}
+        />
           ) : (
         <section className="quota-view" id={key === sceneKey ? "quota-view" : undefined} role="tabpanel" aria-labelledby="main-view-tab-quota">
-        {startingQuotaRead ? (
+        {pane.startingQuotaRead ? (
           <section className="initializing-panel" role="status" aria-live="polite">
             <span className="error-panel__code">{floatingSettingsLoaded ? "QUOTA SYNC / 01" : "LOCAL SERVICE / STARTING"}</span>
             <div className="initializing-panel__body"><span className="initializing-panel__spinner" aria-hidden="true" /><div><h1>{floatingSettingsLoaded ? "正在同步额度" : "正在读取本机数据"}</h1><p>{floatingSettingsLoaded ? "正在检查所选平台账户并读取额度，已有缓存会优先显示。" : "正在准备账户缓存与后台同步，完成后会自动显示额度。"}</p></div></div>
           </section>
-        ) : !displayedQuotaLoading && displayedQuotaError && !displayedUsage ? (
-          <section className="error-panel"><span className="error-panel__code">CONNECTION / 01</span><h1>还没读到额度</h1><p>{displayedQuotaError}</p><button onClick={refreshActiveQuota}>重新检测</button></section>
+        ) : !pane.quotaLoading && pane.quotaError && !pane.usage ? (
+          <section className="error-panel"><span className="error-panel__code">CONNECTION / 01</span><h1>还没读到额度</h1><p>{pane.quotaError}</p><button onClick={refreshActiveQuota}>重新检测</button></section>
         ) : (
           <>
           <section className="hero-grid">
             <article className="quota-card quota-card--primary">
-              <div className="card-heading"><div><span className="eyebrow">PRIMARY WINDOW</span><h1>{primaryLabel}额度</h1></div><span className="live-badge"><i /> LIVE</span></div>
+              <div className="card-heading"><div><span className="eyebrow">PRIMARY WINDOW</span><h1>{pane.primaryLabel}额度</h1></div><span className="live-badge"><i /> LIVE</span></div>
               <div className="primary-layout">
-                <Gauge usedPercent={primary?.usedPercent ?? 0} mode={floatingSettings.displayMode} />
-              <div className="quota-copy"><p>本周期{metricLabel(primaryOppositeMode)}</p><strong>{Math.round(primaryOppositeMetric)}<small>%</small></strong><div className="divider" /><p>重置时间</p><b>{primary ? formatResetAt(primary.resetsAt) : "等待数据"}</b>{primary && <span className="reset-countdown">剩余 {formatRemaining(primary.resetsAt, nowMs)}</span>}</div>
+                <Gauge usedPercent={pane.primary?.usedPercent ?? 0} mode={pane.displayMode} />
+              <div className="quota-copy"><p>本周期{metricLabel(pane.primaryOppositeMode)}</p><strong>{Math.round(pane.primaryOppositeMetric)}<small>%</small></strong><div className="divider" /><p>重置时间</p><b>{pane.primary ? formatResetAt(pane.primary.resetsAt) : "等待数据"}</b>{pane.primary && <span className="reset-countdown">剩余 {formatRemaining(pane.primary.resetsAt, nowMs)}</span>}</div>
               </div>
               <div className="card-note">额度数据 · 自动同步</div>
             </article>
 
             <article className="quota-card quota-card--secondary">
-              <div className="card-heading"><div><span className="eyebrow">SECONDARY WINDOW</span><h2>{secondaryLabel}额度</h2></div><span className="index-label">02</span></div>
-              <Gauge usedPercent={secondary?.usedPercent ?? 0} mode={floatingSettings.displayMode} compact />
-              <div className="bar-copy"><span>{metricLabel(floatingSettings.displayMode)} {Math.round(secondaryMetric)}%</span><span>{floatingSettings.displayMode === "used" ? "可用" : "已使用"} {Math.round(100 - secondaryMetric)}%</span></div>
-              <div className="progress-track"><span style={{ width: `${secondaryMetric}%` }} /></div>
-              <div className="reset-row"><span>重置时间</span><div><strong>{secondary ? formatResetAt(secondary.resetsAt) : "等待数据"}</strong>{secondary && <small>剩余 {formatRemaining(secondary.resetsAt, nowMs)}</small>}</div></div>
+              <div className="card-heading"><div><span className="eyebrow">SECONDARY WINDOW</span><h2>{pane.secondaryLabel}额度</h2></div><span className="index-label">02</span></div>
+              <Gauge usedPercent={pane.secondary?.usedPercent ?? 0} mode={pane.displayMode} compact />
+              <div className="bar-copy"><span>{metricLabel(pane.displayMode)} {Math.round(pane.secondaryMetric)}%</span><span>{pane.displayMode === "used" ? "可用" : "已使用"} {Math.round(100 - pane.secondaryMetric)}%</span></div>
+              <div className="progress-track"><span style={{ width: `${pane.secondaryMetric}%`, transition: key === sceneKey ? undefined : "none" }} /></div>
+              <div className="reset-row"><span>重置时间</span><div><strong>{pane.secondary ? formatResetAt(pane.secondary.resetsAt) : "等待数据"}</strong>{pane.secondary && <small>剩余 {formatRemaining(pane.secondary.resetsAt, nowMs)}</small>}</div></div>
             </article>
           </section>
 
           <section className="account-strip">
-            <div className="account-identity"><span className="avatar">{displayedUsage?.email?.slice(0, 1).toUpperCase() || "C"}</span><div><span>当前账户</span><strong>{displayedUsage?.email || "—"}</strong></div></div>
-            <div className="stat"><span>订阅</span><strong>{planLabel(displayedUsage?.planType ?? null)}</strong></div>
-            <div className="stat"><span>可用余额</span><strong>{activePlatform === "cursor" ? displayedUsage?.creditBalance ?? "—" : displayedUsage?.unlimited ? "无限" : displayedUsage?.hasCredits ? displayedUsage.creditBalance : "未启用"}</strong></div>
-            <div className="stat"><span>重置券</span><strong>{displayedUsage?.resetCredits ?? 0} 张</strong></div>
+            <div className="account-identity"><span className="avatar">{pane.usage?.email?.slice(0, 1).toUpperCase() || "C"}</span><div><span>当前账户</span><strong>{pane.usage?.email || "—"}</strong></div></div>
+            <div className="stat"><span>订阅</span><strong>{planLabel(pane.usage?.planType ?? null)}</strong></div>
+            <div className="stat"><span>可用余额</span><strong>{pane.platform === "cursor" ? pane.usage?.creditBalance ?? "—" : pane.usage?.unlimited ? "无限" : pane.usage?.hasCredits ? pane.usage.creditBalance : "未启用"}</strong></div>
+            <div className="stat"><span>重置券</span><strong>{pane.usage?.resetCredits ?? 0} 张</strong></div>
           </section>
           </>
         )}
         </section>
           )}
+          </PrettyScroller>
         </animated.div>
-      ))}
+        );
+      })}
       </div>
       <footer><span>AI USAGE METER / WINDOWS</span><span>{activePlatform === "codex" ? "CODEX" : "CURSOR"} · LOCAL TOKEN LEDGER</span></footer>
       </section>
@@ -1988,10 +2452,125 @@ function DashboardApp() {
   );
 }
 
+function TrayStatusApp() {
+  const [status, setStatus] = useState<TaskbarStatusPayload>({
+    title: "AI Usage Meter",
+    tooltip: "",
+    platformLabel: "—",
+    primaryName: "额度",
+    primaryPercent: null,
+    primaryReset: "读取中",
+    secondaryName: "额度",
+    secondaryPercent: null,
+    secondaryReset: "读取中",
+    quotaLine: "额度：读取中",
+    tokenLine: "Token：读取中",
+    sessionLine: "会话：读取中",
+    modelLine: "模型：—",
+    sessionItems: [],
+    usedPercent: null,
+  });
+  const [theme, setTheme] = useState<FloatingSettings["theme"]>(defaultFloatingSettings.theme);
+
+  useEffect(() => {
+    document.documentElement.classList.add("tray-document");
+    return () => document.documentElement.classList.remove("tray-document");
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+
+  useEffect(() => {
+    let active = true;
+    let unlistenStatus: (() => void) | undefined;
+    let unlistenSettings: (() => void) | undefined;
+    void listen<TaskbarStatusPayload>("taskbar-status-updated", (event) => {
+      if (active) setStatus(event.payload);
+    }).then((unlisten) => {
+      unlistenStatus = unlisten;
+    });
+    void listen<FloatingSettings>("floating-settings-changed", (event) => {
+      if (active) setTheme(event.payload.theme);
+    }).then((unlisten) => {
+      unlistenSettings = unlisten;
+    });
+    void invoke<FloatingSettings>("get_floating_settings")
+      .then((settings) => {
+        if (active) setTheme(settings.theme);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unlistenStatus?.();
+      unlistenSettings?.();
+    };
+  }, []);
+
+  const primaryWidth = status.primaryPercent == null ? 0 : clamp(status.primaryPercent);
+  const secondaryWidth = status.secondaryPercent == null ? 0 : clamp(status.secondaryPercent);
+
+  return (
+    <main
+      className="tray-popover"
+      aria-label="托盘额度状态"
+      onMouseEnter={() => void invoke("tray_popover_pointer", { inside: true }).catch(() => undefined)}
+      onMouseLeave={() => void invoke("tray_popover_pointer", { inside: false }).catch(() => undefined)}
+    >
+      <section className="tray-popover__quota">
+        <div className="tray-popover__quota-head">
+          <strong>{status.primaryName}</strong>
+          <span>{status.platformLabel}</span>
+        </div>
+        <div className="tray-popover__meter" aria-hidden="true">
+          <i style={{ width: `${primaryWidth}%` }} />
+        </div>
+        <div className="tray-popover__quota-meta">
+          <span>{status.primaryReset}</span>
+        </div>
+        <div className="tray-popover__meter tray-popover__meter--secondary" aria-hidden="true">
+          <i style={{ width: `${secondaryWidth}%` }} />
+        </div>
+        <div className="tray-popover__quota-meta">
+          <span>{status.secondaryName}</span>
+          <span>{status.secondaryReset}</span>
+        </div>
+      </section>
+
+      <section className="tray-popover__block">
+        <header>Token</header>
+        <p>{status.tokenLine.replace(/^Token：/, "")}</p>
+      </section>
+
+      <section className="tray-popover__block">
+        <header>会话</header>
+        {status.sessionItems.length > 0 ? (
+          <ul>
+            {status.sessionItems.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        ) : (
+          <p>{status.sessionLine.replace(/^会话：/, "")}</p>
+        )}
+      </section>
+
+      <nav className="tray-popover__actions">
+        <button type="button" onClick={() => void invoke("open_main_from_tray").catch(() => undefined)}>打开主窗口</button>
+        <button type="button" className="is-danger" onClick={() => void invoke("quit_from_tray").catch(() => undefined)}>退出</button>
+      </nav>
+    </main>
+  );
+}
+
 function App() {
-  const isFloating = new URLSearchParams(window.location.search).get("view") === "floating";
-  if (isFloating) document.documentElement.classList.add("floating-document");
-  return isFloating ? <FloatingApp /> : <DashboardApp />;
+  const view = new URLSearchParams(window.location.search).get("view");
+  if (view === "floating") {
+    document.documentElement.classList.add("floating-document");
+    return <FloatingApp />;
+  }
+  if (view === "tray" || view === "taskbar") {
+    return <TrayStatusApp />;
+  }
+  return <DashboardApp />;
 }
 
 export default App;

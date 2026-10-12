@@ -1,6 +1,6 @@
 [package]
 name = "ai-usage-meter"
-version = "1.0.5"
+version = "1.0.6"
 description = "Multi-platform AI usage meter for Windows"
 authors = ["AI Usage Meter"]
 edition = "2021"

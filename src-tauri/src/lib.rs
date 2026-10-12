@@ -7,16 +7,17 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     env,
     ffi::OsString,
     fs,
     fs::File,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-        mpsc, Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        mpsc, Arc, LazyLock, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -38,6 +39,14 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const FLOATING_CARD_WIDTH: f64 = 276.0;
 const FLOATING_CARD_HEIGHT: f64 = 150.0;
+const TRAY_POPOVER_WIDTH: f64 = 292.0;
+const TRAY_POPOVER_HEIGHT: f64 = 318.0;
+/// Drop from "当前进行的会话" after this much silence (ended / interrupted).
+const ACTIVE_SESSION_IDLE_SECS: i64 = 90;
+const SESSION_DISK_WRITE_INTERVAL: Duration = Duration::from_secs(60);
+/// Cursor mid-turn: assistant transcript text only (≈ 4 UTF-8 bytes / token).
+const CURSOR_TRANSCRIPT_BYTES_PER_TOKEN: u64 = 4;
+const CURSOR_TRANSCRIPT_SCAN_TTL_SECS: u64 = 30 * 60;
 // User-configured floating dimensions are logical CSS pixels. Tauri and the
 // Per-Monitor-V2 WebView scale them to physical pixels for each display.
 const DEFAULT_FLOATING_CARD_SCALE: u32 = 100;
@@ -58,10 +67,33 @@ const MAX_ORB_WAVE_AMPLITUDE: f64 = 4.0;
 const DEFAULT_SYNC_INTERVAL_SECS: u64 = 60;
 const MIN_SYNC_INTERVAL_SECS: u64 = 5;
 const MAX_SYNC_INTERVAL_SECS: u64 = 86_400;
+
+fn default_true() -> bool {
+    true
+}
 const CURSOR_TOKEN_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CURSOR_TOKEN_SYNC_TIMEOUT: Duration = Duration::from_secs(150);
 static CURSOR_LAST_SYNC_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
 static CURSOR_CREDENTIALS_LOCK: Mutex<()> = Mutex::new(());
+static CURSOR_TRANSCRIPT_CURSORS: LazyLock<Mutex<HashMap<PathBuf, LiveLogCursor>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CODEX_SESSION_CURSORS: LazyLock<Mutex<HashMap<PathBuf, LiveLogCursor>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone)]
+struct LiveLogCursor {
+    size: u64,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct LiveLogGrowthSample {
+    session_id: String,
+    project_label: String,
+    estimated_tokens: u64,
+    last_activity_at: i64,
+    started_at: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,8 +158,33 @@ struct CursorTokenUsageStats {
     events_scanned: u64,
     cache_available: bool,
     sync_performed: bool,
+    /// True while a background Tokscale sync is still running.
+    sync_in_progress: bool,
     sync_error: Option<String>,
     updated_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveSession {
+    id: String,
+    label: String,
+    model: Option<String>,
+    status: String,
+    cwd: Option<String>,
+    started_at: i64,
+    last_activity_at: i64,
+    output_tokens: u64,
+    open_turns: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveSessionsStats {
+    current_model: Option<String>,
+    active_sessions: Vec<ActiveSession>,
+    available: bool,
+    updated_at: u64,
 }
 
 #[derive(Default)]
@@ -151,6 +208,14 @@ struct PersistedState {
     codex_path: Option<PathBuf>,
     last_usage: Option<UsageSnapshot>,
     last_cursor_quota: Option<CursorQuotaSnapshot>,
+    #[serde(default)]
+    last_codex_sessions: Option<ActiveSessionsStats>,
+    #[serde(default)]
+    last_cursor_sessions: Option<ActiveSessionsStats>,
+    #[serde(default, rename = "lastCodexSpeed", alias = "last_codex_speed", skip_serializing)]
+    _legacy_last_codex_speed: Option<serde_json::Value>,
+    #[serde(default, rename = "lastCursorSpeed", alias = "last_cursor_speed", skip_serializing)]
+    _legacy_last_cursor_speed: Option<serde_json::Value>,
     main_position: Option<SavedPosition>,
     #[serde(alias = "floatingPosition")]
     floating_position: Option<SavedPosition>,
@@ -174,6 +239,10 @@ struct PersistedState {
     theme: String,
     proxy_mode: String,
     proxy_address: String,
+    #[serde(default = "default_true")]
+    taskbar_status_visible: bool,
+    #[serde(default, rename = "floatingShowSpeed", alias = "floating_show_speed", skip_serializing)]
+    _legacy_floating_show_speed: Option<bool>,
 }
 
 impl Default for PersistedState {
@@ -183,6 +252,10 @@ impl Default for PersistedState {
             codex_path: None,
             last_usage: None,
             last_cursor_quota: None,
+            last_codex_sessions: None,
+            last_cursor_sessions: None,
+            _legacy_last_codex_speed: None,
+            _legacy_last_cursor_speed: None,
             main_position: None,
             floating_position: None,
             floating_card_position: None,
@@ -204,6 +277,8 @@ impl Default for PersistedState {
             theme: "obsidian".to_owned(),
             proxy_mode: "system".to_owned(),
             proxy_address: String::new(),
+            taskbar_status_visible: true,
+            _legacy_floating_show_speed: None,
         }
     }
 }
@@ -212,12 +287,17 @@ struct AppState {
     file_path: PathBuf,
     data: Mutex<PersistedState>,
     save_sender: mpsc::Sender<PersistedState>,
+    last_session_disk_write: Mutex<Option<Instant>>,
     floating_pinned: Arc<AtomicBool>,
     floating_orb: Arc<AtomicBool>,
     floating_orb_size: Arc<AtomicU32>,
     floating_card_scale: Arc<AtomicU32>,
     floating_orb_dragging: AtomicBool,
     floating_orb_expanded: Arc<AtomicBool>,
+    /// True while the tray status popover is pinned open by a click.
+    tray_popover_pinned: AtomicBool,
+    /// Bumped to cancel a pending delayed hide of the tray popover.
+    tray_popover_hide_gen: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -239,6 +319,7 @@ struct FloatingSettings {
     theme: String,
     proxy_mode: String,
     proxy_address: String,
+    taskbar_status_visible: bool,
     data_directory: String,
 }
 
@@ -335,6 +416,48 @@ fn update_state(state: &AppState, update: impl FnOnce(&mut PersistedState)) -> R
         .save_sender
         .send(snapshot)
         .map_err(|_| "后台存储线程已停止".to_owned())
+}
+
+fn cache_session_stats(
+    state: &AppState,
+    platform: &str,
+    stats: ActiveSessionsStats,
+) -> Result<(), String> {
+    let snapshot = {
+        let mut data = state
+            .data
+            .lock()
+            .map_err(|_| "本地状态暂时不可用".to_owned())?;
+        if platform == "cursor" {
+            data.last_cursor_sessions = Some(stats);
+        } else {
+            data.last_codex_sessions = Some(stats);
+        }
+        data.clone()
+    };
+    let should_write = {
+        let mut last_write = state
+            .last_session_disk_write
+            .lock()
+            .map_err(|_| "本地状态暂时不可用".to_owned())?;
+        match *last_write {
+            Some(at) if at.elapsed() < SESSION_DISK_WRITE_INTERVAL => false,
+            _ => {
+                *last_write = Some(Instant::now());
+                true
+            }
+        }
+    };
+    if should_write {
+        let _ = state.save_sender.send(snapshot);
+    }
+    Ok(())
+}
+
+fn flush_persisted_state_to_disk(state: &AppState) {
+    if let Ok(data) = state.data.lock() {
+        let _ = state.save_sender.send(data.clone());
+    }
 }
 
 fn start_state_writer(file_path: PathBuf) -> mpsc::Sender<PersistedState> {
@@ -1163,6 +1286,28 @@ fn cursor_tokscale_executable(app: &AppHandle) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+fn force_kill_child(child: &mut std::process::Child) {
+    #[cfg(target_os = "windows")]
+    {
+        let pid = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    let _ = child.kill();
+    for _ in 0..20 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => return,
+        }
+    }
+}
+
 fn run_tokscale_cursor_sync(app: &AppHandle, network: &NetworkSettings) -> Result<(), String> {
     let executable = cursor_tokscale_executable(app)
         .ok_or_else(|| "Tokscale 组件缺失，请重新安装本应用。".to_owned())?;
@@ -1229,15 +1374,14 @@ fn run_tokscale_cursor_sync(app: &AppHandle, network: &NetworkSettings) -> Resul
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
+                force_kill_child(&mut child);
+                // Avoid joining a stuck stdout reader forever after a hung sync.
+                drop(stdout_reader);
                 return Err("Cursor Token 同步超时；稍后可重试。".to_owned());
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
+                force_kill_child(&mut child);
+                drop(stdout_reader);
                 return Err("读取 Cursor Token 同步进程状态失败。".to_owned());
             }
         }
@@ -1372,6 +1516,7 @@ fn read_cursor_token_usage_stats(
         events_scanned,
         cache_available: cache_readable,
         sync_performed,
+        sync_in_progress: false,
         sync_error,
         updated_at,
     }
@@ -1390,12 +1535,15 @@ fn sync_and_read_cursor_tokens(
             events_scanned: 0,
             cache_available: false,
             sync_performed: false,
+            sync_in_progress: false,
             sync_error: Some("无法定位 Windows 用户目录。".to_owned()),
             updated_at: None,
         };
     };
-    let mut sync_performed = false;
-    let mut sync_error = None;
+
+    // Always surface local cache immediately. Tokscale sync can hang for minutes
+    // across many Cursor accounts; blocking the invoke freezes the Token 视角.
+    let mut stats = read_cursor_token_usage_stats(&home, today_start, tomorrow_start, false, None);
     let (_, newest_cache_at) = cursor_usage_cache_files(&home);
     let cache_recently_synced = newest_cache_at.is_some_and(|timestamp| {
         SystemTime::now()
@@ -1405,25 +1553,37 @@ fn sync_and_read_cursor_tokens(
             .saturating_sub(timestamp)
             < CURSOR_TOKEN_SYNC_INTERVAL.as_secs()
     });
+
     match resolve_cursor_session_token() {
         Ok(Some(_)) => {
             if !cache_recently_synced && claim_cursor_token_sync() {
-                sync_performed = true;
-                sync_error = run_tokscale_cursor_sync(app, network).err();
+                stats.sync_in_progress = true;
+                let app = app.clone();
+                let network = NetworkSettings {
+                    mode: network.mode.clone(),
+                    address: network.address.clone(),
+                };
+                let home = home.clone();
+                thread::spawn(move || {
+                    let sync_error = run_tokscale_cursor_sync(&app, &network).err();
+                    let updated = read_cursor_token_usage_stats(
+                        &home,
+                        today_start,
+                        tomorrow_start,
+                        true,
+                        sync_error,
+                    );
+                    let _ = app.emit("cursor-token-stats-updated", updated);
+                });
             }
         }
         Ok(None) => {
-            sync_error = Some("未检测到 Cursor 登录状态；请先在 Cursor 桌面端登录。".to_owned())
+            stats.sync_error =
+                Some("未检测到 Cursor 登录状态；请先在 Cursor 桌面端登录。".to_owned());
         }
-        Err(error) => sync_error = Some(error),
+        Err(error) => stats.sync_error = Some(error),
     }
-    read_cursor_token_usage_stats(
-        &home,
-        today_start,
-        tomorrow_start,
-        sync_performed,
-        sync_error,
-    )
+    stats
 }
 
 #[tauri::command]
@@ -1766,12 +1926,980 @@ async fn get_token_usage_stats(
     .map_err(|error| format!("读取本机 Token 历史失败：{error}"))
 }
 
+fn output_tokens_from_usage(usage: &Value) -> u64 {
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("outputTokens"))
+        .map(|value| cursor_token_number(Some(value)))
+        .unwrap_or(0);
+    let reasoning = usage
+        .get("reasoning_output_tokens")
+        .or_else(|| usage.get("reasoningOutputTokens"))
+        .map(|value| cursor_token_number(Some(value)))
+        .unwrap_or(0);
+    output.saturating_add(reasoning)
+}
+
+fn empty_active_sessions_stats(available: bool) -> ActiveSessionsStats {
+    ActiveSessionsStats {
+        current_model: None,
+        active_sessions: Vec::new(),
+        available,
+        updated_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    }
+}
+
+fn finalize_active_sessions(
+    mut active_sessions: Vec<ActiveSession>,
+    current_model: Option<String>,
+    available: bool,
+) -> ActiveSessionsStats {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    active_sessions.retain(|session| {
+        session.status == "running"
+            && now.saturating_sub(session.last_activity_at) <= ACTIVE_SESSION_IDLE_SECS
+    });
+    active_sessions.sort_by(|left, right| {
+        right
+            .last_activity_at
+            .cmp(&left.last_activity_at)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    ActiveSessionsStats {
+        current_model,
+        active_sessions,
+        available,
+        updated_at: now as u64,
+    }
+}
+
+fn session_label_from_cwd(cwd: Option<&str>, fallback_id: &str) -> String {
+    cwd.and_then(|path| {
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_owned())
+    })
+    .filter(|name| !name.is_empty())
+    .unwrap_or_else(|| {
+        let short = fallback_id.chars().take(8).collect::<String>();
+        if short.is_empty() {
+            "未命名会话".to_owned()
+        } else {
+            format!("会话 {short}")
+        }
+    })
+}
+
+fn collect_recent_jsonl_paths(directory: &Path, now: i64, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_recent_jsonl_paths(&path, now, out);
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+        {
+            if let Some(mtime) = file_unix_mtime_secs(&path) {
+                if now.saturating_sub(mtime) as u64 <= CURSOR_TRANSCRIPT_SCAN_TTL_SECS {
+                    out.push(path);
+                }
+            }
+        }
+    }
+}
+
+fn codex_session_id_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.rsplit_once('-')
+                .map(|(_, id)| id)
+                .unwrap_or(name)
+                .chars()
+                .take(12)
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "codex-session".to_owned())
+}
+
+fn codex_session_label_from_path(path: &Path) -> String {
+    // Prefer cwd from a quick scan of the first few KB; fall back to short id.
+    if let Ok(file) = File::open(path) {
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        for _ in 0..40 {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if let Some(cwd) = record
+                .pointer("/payload/cwd")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            {
+                return session_label_from_cwd(Some(cwd), &codex_session_id_from_path(path));
+            }
+        }
+    }
+    session_label_from_cwd(None, &codex_session_id_from_path(path))
+}
+
+fn content_output_text_bytes(content: Option<&Value>) -> u64 {
+    let Some(content) = content else {
+        return 0;
+    };
+    if let Some(text) = content.as_str() {
+        return text.len() as u64;
+    }
+    let Some(items) = content.as_array() else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for item in items {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+        // Only model-facing prose — never tool_use / tool_result / images / binary.
+        if !matches!(
+            kind,
+            "text" | "output_text" | "reasoning" | "thinking" | "summary_text" | ""
+        ) {
+            continue;
+        }
+        if let Some(text) = item
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("thinking").and_then(Value::as_str))
+        {
+            total = total.saturating_add(text.len() as u64);
+        }
+    }
+    total
+}
+
+fn assistant_output_text_bytes_from_record(record: &Value) -> u64 {
+    // Cursor agent-transcript: {"role":"assistant","message":{"content":[{"type":"text",...},{"type":"tool_use",...}]}}
+    if record.get("role").and_then(Value::as_str) == Some("assistant") {
+        return content_output_text_bytes(
+            record
+                .pointer("/message/content")
+                .or_else(|| record.get("content")),
+        );
+    }
+
+    match record.get("type").and_then(Value::as_str) {
+        // Codex rollout assistant messages
+        Some("response_item") => {
+            let payload = record.get("payload").unwrap_or(&Value::Null);
+            let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+            let role = payload.get("role").and_then(Value::as_str);
+            if role == Some("assistant") {
+                return content_output_text_bytes(payload.get("content"));
+            }
+            if payload_type == "reasoning" {
+                if let Some(summary) = payload.get("summary") {
+                    return content_output_text_bytes(Some(summary));
+                }
+                return content_output_text_bytes(payload.get("content"));
+            }
+            0
+        }
+        // Codex streamed agent prose (avoid double-counting tool payloads)
+        Some("event_msg") => {
+            let payload_type = record
+                .pointer("/payload/type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if matches!(payload_type, "agent_message" | "agent_reasoning") {
+                if let Some(text) = record
+                    .pointer("/payload/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| record.pointer("/payload/text").and_then(Value::as_str))
+                {
+                    return text.len() as u64;
+                }
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+fn trim_jsonl_line(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let end = line
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &line[start..end]
+}
+
+fn estimate_tokens_from_transcript_bytes(bytes: u64) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    bytes.div_ceil(CURSOR_TRANSCRIPT_BYTES_PER_TOKEN).max(1)
+}
+
+fn file_unix_mtime_secs(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+    )
+}
+
+fn collect_cursor_transcript_paths(home: &Path) -> Vec<PathBuf> {
+    let projects = home.join(".cursor").join("projects");
+    let Ok(project_entries) = fs::read_dir(&projects) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for project in project_entries.flatten() {
+        let transcripts = project.path().join("agent-transcripts");
+        if !transcripts.is_dir() {
+            continue;
+        }
+        let Ok(sessions) = fs::read_dir(&transcripts) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            let session_path = session.path();
+            if session_path.is_dir() {
+                if let Ok(files) = fs::read_dir(&session_path) {
+                    for file in files.flatten() {
+                        let path = file.path();
+                        if path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+                        {
+                            paths.push(path);
+                        }
+                    }
+                }
+            } else if session_path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                paths.push(session_path);
+            }
+        }
+    }
+    paths
+}
+
+fn cursor_project_slug_from_path(path: &Path) -> String {
+    // Cursor project ids look like `d-code-codex` for `D:\code\codex额度显示`:
+    // path separators become '-', non-ASCII characters are dropped, ASCII lowercased.
+    let raw = path.to_string_lossy();
+    let mut slug = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        let mapped = match ch {
+            ':' | '/' | '\\' => Some('-'),
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '.' => {
+                Some(c.to_ascii_lowercase())
+            }
+            _ => None,
+        };
+        match mapped {
+            Some('-') => {
+                if !last_dash && !slug.is_empty() {
+                    slug.push('-');
+                    last_dash = true;
+                }
+            }
+            Some(c) => {
+                slug.push(c);
+                last_dash = false;
+            }
+            None => {}
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+fn percent_decode_bytes(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &input[index + 1..index + 3];
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    out
+}
+
+fn cursor_workspace_folder_from_uri(uri: &str) -> Option<PathBuf> {
+    let trimmed = uri.trim();
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        if let Ok(path) = url.to_file_path() {
+            return Some(path);
+        }
+    }
+    let stripped = trimmed
+        .strip_prefix("file:///")
+        .or_else(|| trimmed.strip_prefix("file://"))?;
+    let decoded = String::from_utf8_lossy(&percent_decode_bytes(stripped)).into_owned();
+    let normalized = decoded.replace('/', "\\");
+    Some(PathBuf::from(normalized))
+}
+
+fn cursor_workspace_label_map() -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    let Some(app_data) = env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
+        user_home_directory().map(|home| home.join("AppData").join("Roaming"))
+    }) else {
+        return labels;
+    };
+    let root = app_data
+        .join("Cursor")
+        .join("User")
+        .join("workspaceStorage");
+    let Ok(entries) = fs::read_dir(root) else {
+        return labels;
+    };
+    for entry in entries.flatten() {
+        let workspace = entry.path().join("workspace.json");
+        let Ok(bytes) = fs::read(&workspace) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(folder) = value
+            .get("folder")
+            .and_then(Value::as_str)
+            .and_then(cursor_workspace_folder_from_uri)
+        else {
+            continue;
+        };
+        let Some(display) = folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_owned())
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let slug = cursor_project_slug_from_path(&folder);
+        if !slug.is_empty() {
+            labels.insert(slug, display);
+        }
+    }
+    labels
+}
+
+fn humanize_cursor_project_slug(slug: &str) -> String {
+    if slug.is_empty() {
+        return "Cursor".to_owned();
+    }
+    if slug.eq_ignore_ascii_case("empty-window") {
+        return "未打开文件夹".to_owned();
+    }
+    let parts = slug
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return slug.to_owned();
+    }
+    let has_drive =
+        parts[0].len() == 1 && parts[0].chars().all(|c| c.is_ascii_alphabetic());
+    if !has_drive {
+        // Already a project-style id (`demo-app`), keep it intact.
+        return slug.to_owned();
+    }
+    let rest = &parts[1..];
+    if rest.is_empty() {
+        return slug.to_owned();
+    }
+    const NOISE: &[&str] = &[
+        "users", "appdata", "roaming", "local", "temp", "program", "files", "documents",
+    ];
+    if let Some(last) = rest.iter().rev().find(|part| {
+        let lower = part.to_ascii_lowercase();
+        !NOISE.contains(&lower.as_str()) && !part.chars().all(|c| c.is_ascii_digit())
+    }) {
+        return (*last).to_owned();
+    }
+    rest.join("-")
+}
+
+fn sanitize_session_model(model: Option<String>) -> Option<String> {
+    model.and_then(|name| {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "default" | "unknown" | "null" | "undefined" => None,
+            _ => Some(trimmed.to_owned()),
+        }
+    })
+}
+
+fn cursor_transcript_project_slug(path: &Path) -> String {
+    path.ancestors()
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("agent-transcripts"))
+        })
+        .and_then(|transcripts| transcripts.parent())
+        .and_then(|project| project.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn cursor_transcript_project_label(path: &Path, workspace_labels: &HashMap<String, String>) -> String {
+    let slug = cursor_transcript_project_slug(path);
+    if slug.is_empty() {
+        return "Cursor".to_owned();
+    }
+    let key = slug.to_ascii_lowercase();
+    if let Some(label) = workspace_labels.get(&key) {
+        return label.clone();
+    }
+    humanize_cursor_project_slug(&slug)
+}
+
+fn cursor_transcript_session_id(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_owned())
+        .or_else(|| {
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_owned())
+        })
+        .unwrap_or_else(|| "cursor-session".to_owned())
+}
+
+fn sample_cursor_transcript_growth(home: &Path, now_unix: i64) -> Vec<LiveLogGrowthSample> {
+    let paths = collect_cursor_transcript_paths(home);
+    let workspace_labels = cursor_workspace_label_map();
+    sample_log_file_growth(
+        &paths,
+        &CURSOR_TRANSCRIPT_CURSORS,
+        now_unix,
+        cursor_transcript_session_id,
+        |path| cursor_transcript_project_label(path, &workspace_labels),
+    )
+}
+
+fn assistant_output_tokens_from_jsonl_line(line: &[u8]) -> u64 {
+    let trimmed = trim_jsonl_line(line);
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let Ok(record) = serde_json::from_slice::<Value>(trimmed) else {
+        return 0;
+    };
+    let text_bytes = assistant_output_text_bytes_from_record(&record);
+    estimate_tokens_from_transcript_bytes(text_bytes)
+}
+
+/// Read newly appended JSONL bytes and estimate tokens from assistant prose only.
+/// Returns (tokens, cursor offset after last complete line) so a trailing partial line is retried.
+fn estimate_assistant_tokens_from_file_growth(path: &Path, from: u64, to: u64) -> (u64, u64) {
+    if to <= from {
+        return (0, from);
+    }
+    let Ok(mut file) = File::open(path) else {
+        return (0, from);
+    };
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return (0, from);
+    }
+    let want = (to - from) as usize;
+    let mut buf = vec![0u8; want];
+    let Ok(read_n) = file.read(&mut buf) else {
+        return (0, from);
+    };
+    buf.truncate(read_n);
+    if buf.is_empty() {
+        return (0, from);
+    }
+
+    let mut tokens = 0u64;
+    let mut consumed = 0usize;
+    let mut line_start = 0usize;
+    for (index, byte) in buf.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        tokens = tokens.saturating_add(assistant_output_tokens_from_jsonl_line(
+            &buf[line_start..index],
+        ));
+        consumed = index + 1;
+        line_start = index + 1;
+    }
+    if consumed == 0 {
+        // Incomplete first line — wait for the rest; do not skip ahead.
+        (0, from)
+    } else {
+        (tokens, from + consumed as u64)
+    }
+}
+
+fn sample_log_file_growth(
+    paths: &[PathBuf],
+    cursors: &Mutex<HashMap<PathBuf, LiveLogCursor>>,
+    now_unix: i64,
+    session_id: impl Fn(&Path) -> String,
+    project_label: impl Fn(&Path) -> String,
+) -> Vec<LiveLogGrowthSample> {
+    let mut samples = Vec::new();
+    let mut seen = HashSet::new();
+    let Ok(mut cursor_map) = cursors.lock() else {
+        return samples;
+    };
+    let tick = Instant::now();
+    for path in paths {
+        let Ok(meta) = fs::metadata(path) else {
+            continue;
+        };
+        let Some(mtime) = file_unix_mtime_secs(path) else {
+            continue;
+        };
+        if now_unix.saturating_sub(mtime) as u64 > CURSOR_TRANSCRIPT_SCAN_TTL_SECS {
+            continue;
+        }
+        let size = meta.len();
+        seen.insert(path.clone());
+        let previous = cursor_map.get(path).cloned();
+        let (estimated_tokens, next_offset) = match previous.as_ref() {
+            // First sighting: baseline at EOF so we only count future growth.
+            None => (0, size),
+            Some(prev) if size < prev.size => (0, size),
+            Some(prev) if size == prev.size => (0, prev.size),
+            Some(prev) => estimate_assistant_tokens_from_file_growth(path, prev.size, size),
+        };
+        cursor_map.insert(
+            path.clone(),
+            LiveLogCursor {
+                size: next_offset,
+                last_seen: tick,
+            },
+        );
+        if previous.is_none() {
+            continue;
+        }
+        let started_at = meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(mtime);
+        samples.push(LiveLogGrowthSample {
+            session_id: session_id(path),
+            project_label: project_label(path),
+            estimated_tokens,
+            last_activity_at: mtime,
+            started_at,
+        });
+    }
+    cursor_map.retain(|path, cursor| {
+        seen.contains(path)
+            || tick.duration_since(cursor.last_seen)
+                < Duration::from_secs(CURSOR_TRANSCRIPT_SCAN_TTL_SECS)
+    });
+    samples
+}
+
+fn active_sessions_from_growth(
+    live_samples: &[LiveLogGrowthSample],
+    now: i64,
+    model: Option<&str>,
+) -> Vec<ActiveSession> {
+    let active_cutoff = now.saturating_sub(ACTIVE_SESSION_IDLE_SECS);
+    let mut conversations: HashMap<String, ActiveSession> = HashMap::new();
+    for sample in live_samples {
+        if sample.last_activity_at < active_cutoff {
+            continue;
+        }
+        let entry = conversations
+            .entry(sample.session_id.clone())
+            .or_insert_with(|| ActiveSession {
+                id: sample.session_id.clone(),
+                label: sample.project_label.clone(),
+                model: model.map(|name| name.to_owned()),
+                status: "running".to_owned(),
+                cwd: None,
+                started_at: sample.started_at,
+                last_activity_at: sample.last_activity_at,
+                output_tokens: 0,
+                open_turns: 1,
+            });
+        entry.started_at = entry.started_at.min(sample.started_at);
+        entry.last_activity_at = entry.last_activity_at.max(sample.last_activity_at);
+        entry.output_tokens = entry.output_tokens.saturating_add(sample.estimated_tokens);
+        entry.status = "running".to_owned();
+        entry.open_turns = entry.open_turns.max(1);
+    }
+    conversations.into_values().collect()
+}
+
+fn peek_codex_model_from_paths(paths: &[PathBuf]) -> Option<String> {
+    for path in paths.iter().rev().take(12) {
+        let Ok(file) = File::open(path) else { continue };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        for _ in 0..40 {
+            line.clear();
+            if reader.read_line(&mut line).ok().unwrap_or(0) == 0 {
+                break;
+            }
+            let Ok(record) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if let Some(model) = record
+                .pointer("/payload/model")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
+                return Some(model.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn read_codex_active_sessions(codex_home: &Path) -> ActiveSessionsStats {
+    let sessions_directory = codex_home.join("sessions");
+    if !sessions_directory.is_dir() {
+        return empty_active_sessions_stats(false);
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mut recent_paths = Vec::new();
+    collect_recent_jsonl_paths(&sessions_directory, now, &mut recent_paths);
+    let live_samples = sample_log_file_growth(
+        &recent_paths,
+        &CODEX_SESSION_CURSORS,
+        now,
+        codex_session_id_from_path,
+        codex_session_label_from_path,
+    );
+    let current_model = peek_codex_model_from_paths(&recent_paths);
+    let active_sessions =
+        active_sessions_from_growth(&live_samples, now, current_model.as_deref());
+    finalize_active_sessions(active_sessions, current_model, true)
+}
+
+fn peek_cursor_model_from_cache(home: &Path) -> Option<String> {
+    let (files, _) = cursor_usage_cache_files(home);
+    let mut best: Option<(String, i64)> = None;
+    for path in &files {
+        let Ok(bytes) = fs::read(path) else { continue };
+        let Ok(cache) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(events) = cache.get("usageEventsDisplay").and_then(Value::as_array) else {
+            continue;
+        };
+        for event in events {
+            let Some(at) = cursor_event_timestamp(event.get("timestamp")) else {
+                continue;
+            };
+            let Some(name) = event
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(_, previous)| at >= *previous) {
+                best = Some((name.to_owned(), at));
+            }
+        }
+    }
+    best.map(|(name, _)| name)
+}
+
+fn read_cursor_active_sessions(home: &Path) -> ActiveSessionsStats {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let live_samples = sample_cursor_transcript_growth(home, now);
+    let current_model = sanitize_session_model(peek_cursor_model_from_cache(home));
+    let mut active_sessions =
+        active_sessions_from_growth(&live_samples, now, current_model.as_deref());
+    for session in &mut active_sessions {
+        session.model = sanitize_session_model(session.model.take());
+    }
+    let available =
+        !live_samples.is_empty() || home.join(".cursor").join("projects").is_dir();
+    finalize_active_sessions(active_sessions, current_model, available)
+}
+
+#[cfg(test)]
+fn reset_live_session_meters_for_test() {
+    if let Ok(mut cursors) = CURSOR_TRANSCRIPT_CURSORS.lock() {
+        cursors.clear();
+    }
+    if let Ok(mut cursors) = CODEX_SESSION_CURSORS.lock() {
+        cursors.clear();
+    }
+}
+
+#[tauri::command]
+fn get_cached_active_sessions(
+    state: State<'_, AppState>,
+) -> Result<Option<ActiveSessionsStats>, String> {
+    Ok(state
+        .data
+        .lock()
+        .map_err(|_| "本地状态暂时不可用".to_owned())?
+        .last_codex_sessions
+        .clone())
+}
+
+#[tauri::command]
+fn get_cached_cursor_active_sessions(
+    state: State<'_, AppState>,
+) -> Result<Option<ActiveSessionsStats>, String> {
+    Ok(state
+        .data
+        .lock()
+        .map_err(|_| "本地状态暂时不可用".to_owned())?
+        .last_cursor_sessions
+        .clone())
+}
+
+#[tauri::command]
+async fn get_active_sessions(
+    state: State<'_, AppState>,
+) -> Result<ActiveSessionsStats, String> {
+    let Some(codex_home) = codex_home_directory() else {
+        return Ok(empty_active_sessions_stats(false));
+    };
+    let stats = tauri::async_runtime::spawn_blocking(move || read_codex_active_sessions(&codex_home))
+        .await
+        .map_err(|error| format!("读取 Codex 会话失败：{error}"))?;
+    let _ = cache_session_stats(&state, "codex", stats.clone());
+    Ok(stats)
+}
+
+#[tauri::command]
+async fn get_cursor_active_sessions(
+    state: State<'_, AppState>,
+) -> Result<ActiveSessionsStats, String> {
+    let Some(home) = user_home_directory() else {
+        return Ok(empty_active_sessions_stats(false));
+    };
+    let stats = tauri::async_runtime::spawn_blocking(move || read_cursor_active_sessions(&home))
+        .await
+        .map_err(|error| format!("读取 Cursor 会话失败：{error}"))?;
+    let _ = cache_session_stats(&state, "cursor", stats.clone());
+    Ok(stats)
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_skip_taskbar(false);
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+fn hide_main_window_to_tray(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+        let _ = window.set_skip_taskbar(true);
+    }
+}
+
+fn tray_status_enabled(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .data
+        .lock()
+        .map(|data| data.taskbar_status_visible)
+        .unwrap_or(true)
+}
+
+fn apply_taskbar_status_visibility(app: &AppHandle, visible: bool) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("tray") else {
+        return Ok(());
+    };
+    let _ = window.set_size(LogicalSize::new(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT));
+    let _ = window.set_skip_taskbar(true);
+    if !visible {
+        app.state::<AppState>()
+            .tray_popover_pinned
+            .store(false, Ordering::Relaxed);
+        let _ = window.hide();
+    }
+    Ok(())
+}
+
+fn cancel_tray_popover_hide(app: &AppHandle) {
+    let _ = app
+        .state::<AppState>()
+        .tray_popover_hide_gen
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+fn cursor_over_window(window: &WebviewWindow) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::{
+            Foundation::{POINT, RECT},
+            UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect},
+        };
+        let Ok(raw_hwnd) = window.hwnd() else {
+            return false;
+        };
+        let hwnd = raw_hwnd.0 as isize as windows_sys::Win32::Foundation::HWND;
+        let mut point = POINT { x: 0, y: 0 };
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let ok = unsafe { GetCursorPos(&mut point) != 0 && GetWindowRect(hwnd, &mut rect) != 0 };
+        return ok
+            && point.x >= rect.left
+            && point.x <= rect.right
+            && point.y >= rect.top
+            && point.y <= rect.bottom;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        false
+    }
+}
+
+fn position_tray_popover(window: &WebviewWindow, tray_rect: &tauri::Rect) {
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let position = tray_rect.position.to_physical::<f64>(scale);
+    let tray_size = tray_rect.size.to_physical::<f64>(scale);
+    let win_w = f64::from(size.width);
+    let win_h = f64::from(size.height);
+    let tray_x = position.x;
+    let tray_y = position.y;
+    let tray_w = tray_size.width;
+    let tray_h = tray_size.height;
+
+    // Prefer above the tray icon (Windows notification area is usually bottom).
+    let mut x: f64 = tray_x + tray_w / 2.0 - win_w / 2.0;
+    let mut y: f64 = tray_y - win_h - 10.0;
+    if y < 8.0 {
+        y = tray_y + tray_h + 10.0;
+    }
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let monitor_pos = monitor.position();
+        let monitor_size = monitor.size();
+        let left = f64::from(monitor_pos.x);
+        let top = f64::from(monitor_pos.y);
+        let right = left + f64::from(monitor_size.width);
+        let bottom = top + f64::from(monitor_size.height);
+        x = x.clamp(left + 8.0, (right - win_w - 8.0).max(left + 8.0));
+        y = y.clamp(top + 8.0, (bottom - win_h - 8.0).max(top + 8.0));
+    }
+    let _ = window.set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
+}
+
+fn show_tray_popover(app: &AppHandle, tray_rect: &tauri::Rect, focus: bool) {
+    if !tray_status_enabled(app) {
+        return;
+    }
+    let Some(window) = app.get_webview_window("tray") else {
+        return;
+    };
+    cancel_tray_popover_hide(app);
+    let _ = window.set_size(LogicalSize::new(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT));
+    let _ = window.set_skip_taskbar(true);
+    position_tray_popover(&window, tray_rect);
+    let _ = window.show();
+    if focus {
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_tray_popover(app: &AppHandle, force: bool) {
+    let state = app.state::<AppState>();
+    if !force && state.tray_popover_pinned.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(window) = app.get_webview_window("tray") {
+        if !force && cursor_over_window(&window) {
+            return;
+        }
+        let _ = window.hide();
+    }
+    if force {
+        state.tray_popover_pinned.store(false, Ordering::Relaxed);
+    }
+}
+
+fn schedule_tray_popover_hide(app: AppHandle) {
+    let gen = app
+        .state::<AppState>()
+        .tray_popover_hide_gen
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(280));
+        if app
+            .state::<AppState>()
+            .tray_popover_hide_gen
+            .load(Ordering::Relaxed)
+            != gen
+        {
+            return;
+        }
+        hide_tray_popover(&app, false);
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2125,6 +3253,7 @@ fn get_floating_settings(state: State<'_, AppState>) -> Result<FloatingSettings,
         theme: data.theme.clone(),
         proxy_mode: data.proxy_mode.clone(),
         proxy_address: data.proxy_address.clone(),
+        taskbar_status_visible: data.taskbar_status_visible,
         data_directory: state
             .file_path
             .parent()
@@ -3322,7 +4451,12 @@ fn set_floating_style(
     state.floating_orb_expanded.store(false, Ordering::Relaxed);
     update_state(&state, |data| data.floating_style = style.clone())?;
     target_window
-        .set_size(floating_logical_size(&style, false, orb_size, card_scale))
+        .set_size(floating_logical_size(
+            &style,
+            false,
+            orb_size,
+            card_scale,
+        ))
         .map_err(|error| error.to_string())?;
     let target_position = state
         .data
@@ -3751,6 +4885,80 @@ fn set_display_mode(
     Ok(mode)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskbarStatusUpdate {
+    title: String,
+    tooltip: String,
+    platform_label: String,
+    primary_name: String,
+    primary_percent: Option<f64>,
+    primary_reset: String,
+    secondary_name: String,
+    secondary_percent: Option<f64>,
+    secondary_reset: String,
+    quota_line: String,
+    token_line: String,
+    session_line: String,
+    model_line: String,
+    session_items: Vec<String>,
+    /// Primary window used percent 0–100 (raw used, for progress coloring).
+    used_percent: Option<f64>,
+}
+
+#[tauri::command]
+fn update_taskbar_status(app: AppHandle, status: TaskbarStatusUpdate) -> Result<(), String> {
+    if let Some(tray) = app.tray_by_id("ai-usage-meter-tray") {
+        // Keep tray tip short; the rich popover carries the full breakdown.
+        let tip = if status.title.chars().count() > 60 {
+            status.title.chars().take(57).collect::<String>() + "…"
+        } else {
+            status.title.clone()
+        };
+        tray.set_tooltip(Some(tip.as_str()))
+            .map_err(|error| error.to_string())?;
+    }
+    let _ = app.emit("taskbar-status-updated", status);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_taskbar_status_visible(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    visible: bool,
+) -> Result<bool, String> {
+    update_state(&state, |data| data.taskbar_status_visible = visible)?;
+    apply_taskbar_status_visibility(&app, visible)?;
+    let settings = get_floating_settings(state)?;
+    let _ = app.emit("floating-settings-changed", settings);
+    Ok(visible)
+}
+
+#[tauri::command]
+fn tray_popover_pointer(app: AppHandle, inside: bool) {
+    if inside {
+        cancel_tray_popover_hide(&app);
+    } else if !app
+        .state::<AppState>()
+        .tray_popover_pinned
+        .load(Ordering::Relaxed)
+    {
+        schedule_tray_popover_hide(app);
+    }
+}
+
+#[tauri::command]
+fn open_main_from_tray(app: AppHandle) {
+    hide_tray_popover(&app, true);
+    show_main_window(&app);
+}
+
+#[tauri::command]
+fn quit_from_tray(app: AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 fn set_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -> Result<String, String> {
     if !matches!(
@@ -3924,6 +5132,8 @@ fn restore_windows(app: &AppHandle, data: &PersistedState) {
             let _ = window.show();
         }
     }
+    let _ = apply_taskbar_status_visibility(app, data.taskbar_status_visible);
+    // Tray popover stays hidden until the user hovers/clicks the tray icon.
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3963,12 +5173,15 @@ pub fn run() {
                 file_path,
                 data: Mutex::new(persisted.clone()),
                 save_sender,
+                last_session_disk_write: Mutex::new(None),
                 floating_pinned: Arc::clone(&floating_pinned),
                 floating_orb: Arc::clone(&floating_orb),
                 floating_orb_size: Arc::clone(&floating_orb_size),
                 floating_card_scale: Arc::clone(&floating_card_scale),
                 floating_orb_dragging: AtomicBool::new(false),
                 floating_orb_expanded: Arc::clone(&floating_orb_expanded),
+                tray_popover_pinned: AtomicBool::new(false),
+                tray_popover_hide_gen: AtomicU64::new(0),
             });
             if repair_theme_setting {
                 let _ = update_state(&app.state::<AppState>(), |data| {
@@ -4016,7 +5229,10 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show-main" => show_main_window(app),
+                    "show-main" => {
+                        hide_tray_popover(app, true);
+                        show_main_window(app);
+                    }
                     "toggle-floating" => {
                         let _ = toggle_floating(app);
                     }
@@ -4027,13 +5243,38 @@ pub fn run() {
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        show_main_window(tray.app_handle());
+                    let app = tray.app_handle();
+                    match &event {
+                        TrayIconEvent::Enter { rect, .. } | TrayIconEvent::Move { rect, .. } => {
+                            show_tray_popover(app, rect, false);
+                        }
+                        TrayIconEvent::Leave { .. } => {
+                            schedule_tray_popover_hide(app.clone());
+                        }
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            rect,
+                            ..
+                        } => {
+                            let state = app.state::<AppState>();
+                            let pinned = state.tray_popover_pinned.load(Ordering::Relaxed);
+                            if pinned {
+                                state.tray_popover_pinned.store(false, Ordering::Relaxed);
+                                hide_tray_popover(app, true);
+                            } else {
+                                state.tray_popover_pinned.store(true, Ordering::Relaxed);
+                                show_tray_popover(app, rect, true);
+                            }
+                        }
+                        TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        } => {
+                            hide_tray_popover(app, true);
+                            show_main_window(app);
+                        }
+                        _ => {}
                     }
                 })
                 .build(app)?;
@@ -4101,10 +5342,13 @@ pub fn run() {
             WindowEvent::Resized(_)
                 if window.label() == "main" && window.is_minimized().unwrap_or(false) =>
             {
-                let _ = window.hide();
+                hide_main_window_to_tray(window.app_handle());
             }
             WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
                 api.prevent_close();
+                if let Some(state) = window.try_state::<AppState>() {
+                    flush_persisted_state_to_disk(&state);
+                }
                 window.app_handle().exit(0);
             }
             WindowEvent::CloseRequested { api, .. }
@@ -4113,15 +5357,31 @@ pub fn run() {
                 api.prevent_close();
                 let _ = set_floating_visible(window.app_handle(), false);
             }
+            WindowEvent::CloseRequested { api, .. } if window.label() == "tray" => {
+                api.prevent_close();
+                hide_tray_popover(window.app_handle(), true);
+            }
+            WindowEvent::Focused(false) if window.label() == "tray" => {
+                let app = window.app_handle().clone();
+                // Allow moving from tray icon into the popover without immediate dismiss.
+                schedule_tray_popover_hide(app);
+            }
+            WindowEvent::Focused(true) if window.label() == "tray" => {
+                cancel_tray_popover_hide(window.app_handle());
+            }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             get_codex_usage,
             get_cached_usage,
             get_cached_cursor_quota,
+            get_cached_active_sessions,
+            get_cached_cursor_active_sessions,
             get_token_usage_stats,
+            get_active_sessions,
             get_cursor_quota,
             get_cursor_token_usage_stats,
+            get_cursor_active_sessions,
             set_floating_window,
             set_active_platform,
             get_floating_settings,
@@ -4144,6 +5404,11 @@ pub fn run() {
             start_floating_orb_drag,
             show_main_window_command,
             set_display_mode,
+            update_taskbar_status,
+            set_taskbar_status_visible,
+            tray_popover_pointer,
+            open_main_from_tray,
+            quit_from_tray,
             set_theme,
             set_proxy_settings
         ])
@@ -4172,11 +5437,17 @@ mod tests {
         orb_anchor_dock_edges, orb_anchor_is_near_dock_edge, orb_anchor_x_from_window,
         orb_layout_side_from_metrics, orb_side_for_direction, orb_window_x,
         parse_cursor_usage_summary, parse_session_timestamp, parse_usage_responses,
-        persist_cursor_session_token, position_intersects_monitor, quota_sync_wait_ms,
-        read_codex_usage, read_cursor_token_usage_stats, read_token_usage_stats,
+        assistant_output_tokens_from_jsonl_line,
+        cursor_project_slug_from_path, cursor_transcript_project_label,
+        estimate_tokens_from_transcript_bytes, sanitize_session_model,
+        output_tokens_from_usage, persist_cursor_session_token,
+        position_intersects_monitor, reset_live_session_meters_for_test,
+        quota_sync_wait_ms, read_codex_active_sessions, read_codex_usage,
+        read_cursor_active_sessions, read_cursor_token_usage_stats, read_token_usage_stats,
         remove_orb_native_frame, reserve_quota_sync, strip_orb_native_frame_styles,
         validate_floating_card_scale, validate_floating_orb_size, LaunchAction, NetworkSettings,
-        PersistedState, SavedPosition, SessionTokenUsage, DEFAULT_FLOATING_CARD_SCALE,
+        PersistedState, SavedPosition, SessionTokenUsage,
+        DEFAULT_FLOATING_CARD_SCALE,
         DEFAULT_ORB_WAVE_AMPLITUDE, DEFAULT_ORB_WAVE_SPEED, DEFAULT_SYNC_INTERVAL_SECS,
         FLOATING_ORB_SIZE, MAX_FLOATING_CARD_SCALE, MAX_FLOATING_ORB_SIZE, MAX_ORB_WAVE_AMPLITUDE,
         MAX_SYNC_INTERVAL_SECS, MIN_FLOATING_CARD_SCALE, MIN_FLOATING_ORB_SIZE,
@@ -4186,7 +5457,10 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::{json, Value};
     use std::{
+        collections::HashMap,
         fs,
+        io::Write,
+        path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -4391,6 +5665,139 @@ mod tests {
     }
 
     #[test]
+    fn active_sessions_track_recent_transcript_growth() {
+        assert_eq!(estimate_tokens_from_transcript_bytes(0), 0);
+        assert_eq!(estimate_tokens_from_transcript_bytes(1), 1);
+        assert_eq!(estimate_tokens_from_transcript_bytes(8), 2);
+        assert_eq!(
+            cursor_project_slug_from_path(Path::new(r"D:\code\codex额度显示")),
+            "d-code-codex"
+        );
+        assert_eq!(
+            cursor_transcript_project_label(
+                Path::new(
+                    r"C:\Users\x\.cursor\projects\demo-app\agent-transcripts\abc\abc.jsonl"
+                ),
+                &HashMap::new(),
+            ),
+            "demo-app"
+        );
+        let mut labels = HashMap::new();
+        labels.insert("d-code-codex".to_owned(), "codex额度显示".to_owned());
+        assert_eq!(
+            cursor_transcript_project_label(
+                Path::new(
+                    r"C:\Users\x\.cursor\projects\d-code-codex\agent-transcripts\abc\abc.jsonl"
+                ),
+                &labels,
+            ),
+            "codex额度显示"
+        );
+        assert_eq!(sanitize_session_model(Some("default".to_owned())), None);
+        assert_eq!(
+            sanitize_session_model(Some("composer-2.5".to_owned())).as_deref(),
+            Some("composer-2.5")
+        );
+        let tool_line = format!(
+            "{{\"role\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{{\"path\":\"{}\"}}}}]}}}}",
+            "a".repeat(8_000)
+        );
+        assert_eq!(assistant_output_tokens_from_jsonl_line(tool_line.as_bytes()), 0);
+        let text_line = r#"{"role":"assistant","message":{"content":[{"type":"text","text":"abcd"}]}}"#;
+        assert_eq!(assistant_output_tokens_from_jsonl_line(text_line.as_bytes()), 1);
+
+        reset_live_session_meters_for_test();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!(
+            "cursor-active-sessions-{}-{unique}",
+            std::process::id()
+        ));
+        let transcript_dir = home
+            .join(".cursor")
+            .join("projects")
+            .join("demo-project")
+            .join("agent-transcripts")
+            .join("sess-1");
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join("sess-1.jsonl");
+        fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+
+        let first = read_cursor_active_sessions(&home);
+        assert!(first.available);
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        let chunk = "x".repeat(400);
+        write!(
+            file,
+            "{{\"role\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{chunk}\"}}]}}}}\n"
+        )
+        .unwrap();
+        drop(file);
+
+        let second = read_cursor_active_sessions(&home);
+        let _ = fs::remove_dir_all(&home);
+        assert!(second
+            .active_sessions
+            .iter()
+            .any(|session| session.id == "sess-1" && session.status == "running"));
+
+        reset_live_session_meters_for_test();
+        let codex_home = std::env::temp_dir().join(format!(
+            "codex-active-sessions-{}-{unique}",
+            std::process::id()
+        ));
+        let sessions = codex_home.join("sessions/2026/10/09");
+        fs::create_dir_all(&sessions).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let rfc3339 = |secs: i64| {
+            time::OffsetDateTime::from_unix_timestamp(secs)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let start = rfc3339(now - 120);
+        fs::write(
+            sessions.join("rollout-demo-abcd1234efgh.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{start}\",\"type\":\"turn_context\",\"payload\":{{\"cwd\":\"D:/code/demo\",\"model\":\"gpt-test\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let baseline = read_codex_active_sessions(&codex_home);
+        assert!(baseline.available);
+        assert_eq!(baseline.current_model.as_deref(), Some("gpt-test"));
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(sessions.join("rollout-demo-abcd1234efgh.jsonl"))
+            .unwrap();
+        writeln!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}").unwrap();
+        drop(file);
+        let codex = read_codex_active_sessions(&codex_home);
+        let _ = fs::remove_dir_all(&codex_home);
+        assert!(codex
+            .active_sessions
+            .iter()
+            .any(|session| session.status == "running"));
+        assert_eq!(
+            output_tokens_from_usage(&json!({"output_tokens": 10, "reasoning_output_tokens": 5})),
+            15
+        );
+    }
+
+    #[test]
     fn ignores_non_token_records_and_uses_last_usage_when_total_is_missing() {
         let today_start = parse_session_timestamp(Some(&json!({
             "timestamp": "2026-09-29T00:00:00Z"
@@ -4463,6 +5870,8 @@ mod tests {
         let state: PersistedState = serde_json::from_str("{}").unwrap();
         assert_eq!(state.active_platform, "codex");
         assert!(state.last_cursor_quota.is_none());
+        assert!(state.last_codex_sessions.is_none());
+        assert!(state.last_cursor_sessions.is_none());
         assert_eq!(state.floating_opacity, 0.92);
         assert!(!state.floating_pinned);
         assert!(state.floating_always_on_top);
@@ -4661,6 +6070,8 @@ mod tests {
         let large_card = floating_logical_size("card", false, 56, 140);
         assert_eq!((small_card.width, small_card.height), (220.8, 120.0));
         assert_eq!((large_card.width, large_card.height), (386.4, 210.0));
+        let card = floating_logical_size("card", false, 56, 100);
+        assert_eq!((card.width, card.height), (276.0, 150.0));
     }
 
     #[test]
