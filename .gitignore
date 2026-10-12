@@ -15,6 +15,7 @@ src-tauri/target
 _build/
 data/
 output/
+artifacts-linux/
 codex-quota.exe
 
 # Editor directories and files

@@ -1,7 +1,7 @@
 {
   "name": "ai-usage-meter",
   "private": true,
-  "version": "1.0.6",
+  "version": "1.0.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,6 +16,14 @@
     "@tokscale/cli": "4.17.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
+  },
+  "optionalDependencies": {
+    "@tokscale/cli-darwin-arm64": "4.17.0",
+    "@tokscale/cli-darwin-x64": "4.17.0",
+    "@tokscale/cli-linux-arm64-gnu": "4.17.0",
+    "@tokscale/cli-linux-x64-gnu": "4.17.0",
+    "@tokscale/cli-win32-arm64-msvc": "4.17.0",
+    "@tokscale/cli-win32-x64-msvc": "4.17.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

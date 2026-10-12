@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc, Arc, LazyLock, Mutex,
     },
     thread,
@@ -380,12 +380,36 @@ fn reserve_quota_sync(data: &mut PersistedState, now_ms: u64, force: bool) -> u6
 }
 
 fn executable_data_dir() -> Result<PathBuf, String> {
-    let executable =
-        env::current_exe().map_err(|error| format!("无法定位应用程序目录：{error}"))?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| "无法定位应用程序目录".to_owned())?;
-    Ok(directory.join("data"))
+    #[cfg(target_os = "windows")]
+    {
+        let executable =
+            env::current_exe().map_err(|error| format!("无法定位应用程序目录：{error}"))?;
+        let directory = executable
+            .parent()
+            .ok_or_else(|| "无法定位应用程序目录".to_owned())?;
+        return Ok(directory.join("data"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = user_home_directory().ok_or_else(|| "无法定位用户目录".to_owned())?;
+        return Ok(home
+            .join("Library")
+            .join("Application Support")
+            .join("AI Usage Meter"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(xdg) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(xdg).join("ai-usage-meter"));
+        }
+        let home = user_home_directory().ok_or_else(|| "无法定位用户目录".to_owned())?;
+        return Ok(home.join(".local").join("share").join("ai-usage-meter"));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let home = user_home_directory().ok_or_else(|| "无法定位用户目录".to_owned())?;
+        Ok(home.join(".ai-usage-meter"))
+    }
 }
 
 fn migrate_legacy_state(legacy_file: &Path, target_file: &Path) {
@@ -560,9 +584,51 @@ fn find_codex_launcher(cached: Option<&Path>) -> Result<CodexLauncher, String> {
 
 #[cfg(not(target_os = "windows"))]
 fn find_codex_launcher(cached: Option<&Path>) -> Result<CodexLauncher, String> {
-    Ok(launcher_from_path(
-        cached.unwrap_or_else(|| Path::new("codex")).to_path_buf(),
-    ))
+    let mut candidates = Vec::new();
+    if let Some(path) = cached {
+        add_candidate(&mut candidates, path.to_path_buf());
+    }
+    if let Some(path) =
+        env::var_os("AI_USAGE_METER_CODEX_PATH").or_else(|| env::var_os("CODEX_QUOTA_CODEX_PATH"))
+    {
+        add_candidate(&mut candidates, PathBuf::from(path));
+    }
+    if let Some(home) = user_home_directory() {
+        add_candidate(&mut candidates, home.join(".local").join("bin").join("codex"));
+        #[cfg(target_os = "macos")]
+        {
+            add_candidate(
+                &mut candidates,
+                home.join("Applications")
+                    .join("Codex.app")
+                    .join("Contents")
+                    .join("Resources")
+                    .join("codex"),
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        add_candidate(
+            &mut candidates,
+            PathBuf::from("/Applications/Codex.app/Contents/Resources/codex"),
+        );
+        add_candidate(&mut candidates, PathBuf::from("/opt/homebrew/bin/codex"));
+        add_candidate(&mut candidates, PathBuf::from("/usr/local/bin/codex"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        add_candidate(&mut candidates, PathBuf::from("/usr/local/bin/codex"));
+        add_candidate(&mut candidates, PathBuf::from("/usr/bin/codex"));
+    }
+    if let Some(value) = env::var_os("PATH") {
+        for directory in env::split_paths(&value) {
+            add_candidate(&mut candidates, directory.join("codex"));
+        }
+    }
+    candidates.into_iter().next().map(launcher_from_path).ok_or_else(|| {
+        "未找到 Codex。请先安装 Codex 桌面应用或 Codex CLI，并登录 ChatGPT 账号；也可以通过 AI_USAGE_METER_CODEX_PATH 指定 codex。".to_owned()
+    })
 }
 
 fn parse_window(value: Option<&Value>) -> Option<RateWindow> {
@@ -701,27 +767,37 @@ fn user_home_directory() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn cursor_desktop_database_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+fn cursor_support_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     if let Some(app_data) = env::var_os("APPDATA") {
-        candidates.push(
-            PathBuf::from(app_data)
-                .join("Cursor")
-                .join("User")
-                .join("globalStorage")
-                .join("state.vscdb"),
-        );
+        roots.push(PathBuf::from(app_data).join("Cursor"));
     }
     if let Some(home) = user_home_directory() {
-        candidates.push(
-            home.join("AppData")
-                .join("Roaming")
-                .join("Cursor")
-                .join("User")
-                .join("globalStorage")
-                .join("state.vscdb"),
+        roots.push(home.join("AppData").join("Roaming").join("Cursor"));
+        roots.push(
+            home.join("Library")
+                .join("Application Support")
+                .join("Cursor"),
         );
+        if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(xdg).join("Cursor"));
+        }
+        roots.push(home.join(".config").join("Cursor"));
     }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn cursor_desktop_database_candidates() -> Vec<PathBuf> {
+    let mut candidates = cursor_support_roots()
+        .into_iter()
+        .map(|root| {
+            root.join("User")
+                .join("globalStorage")
+                .join("state.vscdb")
+        })
+        .collect::<Vec<_>>();
     candidates.sort();
     candidates.dedup();
     candidates
@@ -1263,26 +1339,68 @@ async fn get_cursor_quota(state: State<'_, AppState>) -> Result<CursorQuotaSnaps
     Ok(snapshot)
 }
 
+fn tokscale_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "tokscale.exe"
+    } else {
+        "tokscale"
+    }
+}
+
+fn tokscale_npm_package_name() -> &'static str {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("windows", "x86_64") => "cli-win32-x64-msvc",
+        ("windows", "aarch64") => "cli-win32-arm64-msvc",
+        ("macos", "x86_64") => "cli-darwin-x64",
+        ("macos", "aarch64") => "cli-darwin-arm64",
+        ("linux", "x86_64") => "cli-linux-x64-gnu",
+        ("linux", "aarch64") => "cli-linux-arm64-gnu",
+        _ => "cli-linux-x64-gnu",
+    }
+}
+
 fn cursor_tokscale_executable(app: &AppHandle) -> Option<PathBuf> {
+    let binary = tokscale_binary_name();
     let mut candidates = Vec::new();
     if let Ok(resource_dir) = app.path().resource_dir() {
-        candidates.push(resource_dir.join("tokscale.exe"));
-        candidates.push(resource_dir.join("resources").join("tokscale.exe"));
+        candidates.push(resource_dir.join(binary));
+        candidates.push(resource_dir.join("resources").join(binary));
     }
     if let Ok(executable) = env::current_exe() {
         if let Some(parent) = executable.parent() {
-            candidates.push(parent.join("tokscale.exe"));
+            candidates.push(parent.join(binary));
+            #[cfg(target_os = "macos")]
+            {
+                // App bundle: Contents/MacOS/../Resources
+                candidates.push(parent.join("../Resources").join(binary));
+            }
         }
     }
+    let npm_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("node_modules");
     candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("node_modules")
+        npm_root
             .join("@tokscale")
-            .join("cli-win32-x64-msvc")
+            .join(tokscale_npm_package_name())
             .join("bin")
-            .join("tokscale.exe"),
+            .join(binary),
     );
+    // Fallbacks when optional deps resolve under a sibling package name.
+    for package in [
+        "cli-win32-x64-msvc",
+        "cli-win32-arm64-msvc",
+        "cli-darwin-x64",
+        "cli-darwin-arm64",
+        "cli-linux-x64-gnu",
+        "cli-linux-arm64-gnu",
+    ] {
+        candidates.push(
+            npm_root
+                .join("@tokscale")
+                .join(package)
+                .join("bin")
+                .join(binary),
+        );
+    }
     candidates.into_iter().find(|path| path.is_file())
 }
 
@@ -2276,50 +2394,47 @@ fn cursor_workspace_folder_from_uri(uri: &str) -> Option<PathBuf> {
         .strip_prefix("file:///")
         .or_else(|| trimmed.strip_prefix("file://"))?;
     let decoded = String::from_utf8_lossy(&percent_decode_bytes(stripped)).into_owned();
+    #[cfg(target_os = "windows")]
     let normalized = decoded.replace('/', "\\");
+    #[cfg(not(target_os = "windows"))]
+    let normalized = decoded;
     Some(PathBuf::from(normalized))
 }
 
 fn cursor_workspace_label_map() -> HashMap<String, String> {
     let mut labels = HashMap::new();
-    let Some(app_data) = env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
-        user_home_directory().map(|home| home.join("AppData").join("Roaming"))
-    }) else {
-        return labels;
-    };
-    let root = app_data
-        .join("Cursor")
-        .join("User")
-        .join("workspaceStorage");
-    let Ok(entries) = fs::read_dir(root) else {
-        return labels;
-    };
-    for entry in entries.flatten() {
-        let workspace = entry.path().join("workspace.json");
-        let Ok(bytes) = fs::read(&workspace) else {
+    for support_root in cursor_support_roots() {
+        let root = support_root.join("User").join("workspaceStorage");
+        let Ok(entries) = fs::read_dir(root) else {
             continue;
         };
-        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        let Some(folder) = value
-            .get("folder")
-            .and_then(Value::as_str)
-            .and_then(cursor_workspace_folder_from_uri)
-        else {
-            continue;
-        };
-        let Some(display) = folder
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.to_owned())
-            .filter(|name| !name.is_empty())
-        else {
-            continue;
-        };
-        let slug = cursor_project_slug_from_path(&folder);
-        if !slug.is_empty() {
-            labels.insert(slug, display);
+        for entry in entries.flatten() {
+            let workspace = entry.path().join("workspace.json");
+            let Ok(bytes) = fs::read(&workspace) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let Some(folder) = value
+                .get("folder")
+                .and_then(Value::as_str)
+                .and_then(cursor_workspace_folder_from_uri)
+            else {
+                continue;
+            };
+            let Some(display) = folder
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_owned())
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            let slug = cursor_project_slug_from_path(&folder);
+            if !slug.is_empty() {
+                labels.insert(slug, display);
+            }
         }
     }
     labels
@@ -2785,35 +2900,21 @@ fn cancel_tray_popover_hide(app: &AppHandle) {
 }
 
 fn cursor_over_window(window: &WebviewWindow) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        use windows_sys::Win32::{
-            Foundation::{POINT, RECT},
-            UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect},
-        };
-        let Ok(raw_hwnd) = window.hwnd() else {
-            return false;
-        };
-        let hwnd = raw_hwnd.0 as isize as windows_sys::Win32::Foundation::HWND;
-        let mut point = POINT { x: 0, y: 0 };
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        let ok = unsafe { GetCursorPos(&mut point) != 0 && GetWindowRect(hwnd, &mut rect) != 0 };
-        return ok
-            && point.x >= rect.left
-            && point.x <= rect.right
-            && point.y >= rect.top
-            && point.y <= rect.bottom;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = window;
-        false
-    }
+    let Ok(cursor) = window.cursor_position() else {
+        return false;
+    };
+    let Ok(position) = window.outer_position() else {
+        return false;
+    };
+    let Ok(size) = window.outer_size() else {
+        return false;
+    };
+    let x = cursor.x.round() as i32;
+    let y = cursor.y.round() as i32;
+    x >= position.x
+        && x < position.x + size.width as i32
+        && y >= position.y
+        && y < position.y + size.height as i32
 }
 
 fn position_tray_popover(window: &WebviewWindow, tray_rect: &tauri::Rect) {
@@ -3066,7 +3167,41 @@ fn start_click_through_controller(
 }
 
 #[cfg(not(target_os = "windows"))]
-fn start_click_through_controller(_: WebviewWindow, _: Arc<AtomicBool>, _: Arc<AtomicBool>) {}
+fn start_click_through_controller(
+    window: WebviewWindow,
+    pinned: Arc<AtomicBool>,
+    orb_mode: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let mut last_passthrough = false;
+        loop {
+            let Ok(cursor) = window.cursor_position() else {
+                break;
+            };
+            let Ok(position) = window.outer_position() else {
+                break;
+            };
+            let Ok(size) = window.outer_size() else {
+                break;
+            };
+            let over_pin = is_floating_pin_hit(
+                cursor.x.round() as i32,
+                cursor.y.round() as i32,
+                position.x,
+                position.y,
+                size.width as i32,
+                size.height as i32,
+            );
+            let passthrough =
+                pinned.load(Ordering::Relaxed) && !orb_mode.load(Ordering::Relaxed) && !over_pin;
+            if passthrough != last_passthrough {
+                let _ = window.set_ignore_cursor_events(passthrough);
+                last_passthrough = passthrough;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
 
 #[cfg(target_os = "windows")]
 fn start_orb_click_through_controller(
@@ -3203,11 +3338,116 @@ fn start_orb_click_through_controller(
 
 #[cfg(not(target_os = "windows"))]
 fn start_orb_click_through_controller(
-    _: WebviewWindow,
-    _: Arc<AtomicBool>,
-    _: Arc<AtomicBool>,
-    _: Arc<AtomicU32>,
+    window: WebviewWindow,
+    orb_mode: Arc<AtomicBool>,
+    expanded: Arc<AtomicBool>,
+    orb_size: Arc<AtomicU32>,
 ) {
+    let app = window.app_handle().clone();
+    thread::spawn(move || {
+        let mut last_passthrough = false;
+        let mut last_over_orb = false;
+        loop {
+            let state = app.state::<AppState>();
+            let is_active = orb_mode.load(Ordering::Relaxed)
+                && window.is_visible().unwrap_or(false)
+                && !state.floating_orb_dragging.load(Ordering::Relaxed);
+            if !is_active {
+                last_over_orb = false;
+                if last_passthrough {
+                    let _ = window.set_ignore_cursor_events(false);
+                    last_passthrough = false;
+                }
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+
+            let Ok(cursor) = window.cursor_position() else {
+                break;
+            };
+            let Ok(position) = window.outer_position() else {
+                break;
+            };
+            let Ok(size) = window.outer_size() else {
+                break;
+            };
+            let cursor_x = cursor.x.round() as i32;
+            let cursor_y = cursor.y.round() as i32;
+            let rect_left = position.x;
+            let rect_top = position.y;
+            let rect_right = position.x + size.width as i32;
+            let rect_bottom = position.y + size.height as i32;
+
+            let mut passthrough = false;
+            let mut over_orb = false;
+            if !expanded.load(Ordering::Relaxed) {
+                let monitor = window
+                    .current_monitor()
+                    .ok()
+                    .flatten()
+                    .or_else(|| window.primary_monitor().ok().flatten());
+                let scale = monitor
+                    .as_ref()
+                    .map(|item| item.scale_factor())
+                    .or_else(|| window.scale_factor().ok())
+                    .unwrap_or(1.0);
+                let monitor_x = monitor
+                    .as_ref()
+                    .map(|item| item.position().x)
+                    .unwrap_or(rect_left);
+                let monitor_width = monitor
+                    .as_ref()
+                    .map(|item| item.size().width)
+                    .unwrap_or(size.width);
+                let side = state
+                    .data
+                    .lock()
+                    .ok()
+                    .map(|data| {
+                        if let Some(anchor) = data.floating_orb_position {
+                            let collapsed_width =
+                                (floating_orb_shell_size(orb_size.load(Ordering::Relaxed)) * scale)
+                                    .round() as u32;
+                            orb_layout_side_from_metrics(
+                                &data.floating_orb_expand_direction,
+                                anchor.x,
+                                collapsed_width,
+                                monitor_x,
+                                monitor_width,
+                                scale,
+                            )
+                        } else {
+                            edge_side(rect_left, size.width, monitor_x, monitor_width)
+                        }
+                    })
+                    .unwrap_or("right");
+                let diameter = (orb_size.load(Ordering::Relaxed) as f64 * scale).round() as i32;
+                let inset = (FLOATING_ORB_VISUAL_INSET * scale).round() as i32;
+                over_orb = is_pointer_inside_orb(
+                    cursor_x,
+                    cursor_y,
+                    rect_left,
+                    rect_top,
+                    rect_right,
+                    rect_bottom,
+                    diameter,
+                    inset,
+                    side,
+                );
+                passthrough = !over_orb;
+                if over_orb && !last_over_orb {
+                    let _ = app.emit("floating-orb-hover-entered", ());
+                }
+            }
+            last_over_orb = over_orb;
+
+            if passthrough != last_passthrough {
+                let _ = window.set_ignore_cursor_events(passthrough);
+                last_passthrough = passthrough;
+            }
+            thread::sleep(Duration::from_millis(16));
+        }
+    });
 }
 
 #[tauri::command]
@@ -3776,13 +4016,131 @@ struct OrbDragResult {
 #[tauri::command]
 fn start_floating_orb_drag(
     app: AppHandle,
-    _cursor_start_x: i32,
-    _cursor_start_y: i32,
+    cursor_start_x: i32,
+    cursor_start_y: i32,
 ) -> Result<(), String> {
+    use device_query::{DeviceQuery, DeviceState};
+
     let window = app
         .get_webview_window("orb")
         .ok_or("悬浮小球窗口尚未创建")?;
-    window.start_dragging().map_err(|error| error.to_string())
+    let state = app.state::<AppState>();
+    let (direction, saved_anchor, orb_size) = {
+        let data = state
+            .data
+            .lock()
+            .map_err(|_| "本地状态暂时不可用".to_owned())?;
+        (
+            data.floating_orb_expand_direction.clone(),
+            data.floating_orb_position,
+            data.floating_orb_size,
+        )
+    };
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let current = SavedPosition {
+        x: position.x,
+        y: position.y,
+    };
+    let anchor = orb_anchor_from_window(&window, &state, current)
+        .or(saved_anchor)
+        .ok_or("无法计算悬浮球位置")?;
+    if state.floating_orb_dragging.swap(true, Ordering::Relaxed) {
+        return Ok(());
+    }
+    if let Err(error) = resize_orb_window_from_anchor(&window, false, &direction, anchor) {
+        state.floating_orb_dragging.store(false, Ordering::Relaxed);
+        return Err(error);
+    }
+    let drag_side = orb_layout_side_for_anchor(&window, &direction, anchor).unwrap_or("left");
+    if let Err(error) = set_orb_window_region(&window, true, drag_side) {
+        state.floating_orb_dragging.store(false, Ordering::Relaxed);
+        return Err(error);
+    }
+    let window_start = match window.outer_position() {
+        Ok(position) => position,
+        Err(error) => {
+            state.floating_orb_dragging.store(false, Ordering::Relaxed);
+            return Err(error.to_string());
+        }
+    };
+
+    thread::spawn(move || {
+        let device_state = DeviceState::new();
+        let mut moved = false;
+        loop {
+            if let Ok(cursor) = window.cursor_position() {
+                let cursor_x = cursor.x.round() as i32;
+                let cursor_y = cursor.y.round() as i32;
+                let delta_x = cursor_x - cursor_start_x;
+                let delta_y = cursor_y - cursor_start_y;
+                moved |= delta_x.abs() > 1 || delta_y.abs() > 1;
+                let _ = window.set_position(PhysicalPosition::new(
+                    window_start.x + delta_x,
+                    window_start.y + delta_y,
+                ));
+            }
+            let mouse = device_state.get_mouse();
+            // device_query: button index 1 is left mouse.
+            if mouse.button_pressed.get(1).copied() != Some(true) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(8));
+        }
+        let state = app.state::<AppState>();
+        let mut at_edge = false;
+        let mut side = "right".to_owned();
+        if let Ok(position) = window.outer_position() {
+            let mut final_anchor = SavedPosition {
+                x: position.x,
+                y: position.y,
+            };
+            if let Ok(monitor) = monitor_for_orb_anchor(&window, final_anchor) {
+                let scale = monitor.scale_factor();
+                let size = (floating_orb_shell_size(orb_size) * scale).round() as i32;
+                let visual_inset = (FLOATING_ORB_VISUAL_INSET * scale).round() as i32;
+                let (left_x, right_x) = orb_anchor_dock_edges(
+                    monitor.position().x,
+                    monitor.size().width,
+                    size as u32,
+                    visual_inset,
+                );
+                final_anchor.x = final_anchor.x.clamp(left_x, right_x);
+                final_anchor.y = clamp_vertical(
+                    final_anchor.y,
+                    size as u32,
+                    monitor.position().y,
+                    monitor.size().height,
+                    visual_inset,
+                );
+                if final_anchor.x != position.x || final_anchor.y != position.y {
+                    let _ =
+                        window.set_position(PhysicalPosition::new(final_anchor.x, final_anchor.y));
+                }
+            }
+            at_edge = orb_is_near_edge(&window, &state, final_anchor).unwrap_or(false);
+            if at_edge {
+                if let Some((snapped, _)) = orb_edge_anchor(&window, &state, final_anchor) {
+                    final_anchor = snapped;
+                    let _ = resize_orb_window_from_anchor(&window, false, &direction, final_anchor);
+                }
+            }
+            side = orb_layout_side_for_anchor(&window, &direction, final_anchor)
+                .unwrap_or("right")
+                .to_owned();
+            let _ = remember_floating_position_for_style(&state, "orb", final_anchor);
+        }
+        state.floating_orb_dragging.store(false, Ordering::Relaxed);
+        let _ = app.emit(
+            "floating-orb-drag-ended",
+            OrbDragResult {
+                moved,
+                at_edge,
+                side,
+            },
+        );
+    });
+
+    Ok(())
 }
 
 fn orb_is_near_edge(
@@ -3848,18 +4206,21 @@ fn is_pointer_inside_orb(
     dx * dx + dy * dy <= radius * radius
 }
 
+#[cfg(target_os = "windows")]
 const ORB_NONCLIENT_FRAME_STYLE_MASK: isize = 0x00CF_0000; // WS_CAPTION|WS_THICKFRAME|WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX
+#[cfg(target_os = "windows")]
 const ORB_WINDOW_EDGE_EX_STYLE_MASK: isize = 0x0002_0301; // WS_EX_WINDOWEDGE|WS_EX_CLIENTEDGE|WS_EX_DLGMODALFRAME|WS_EX_STATICEDGE
 
 #[cfg(target_os = "windows")]
 static ORB_WNDPROC_INSTALLED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
-static ORB_HOOKED_HWND: AtomicUsize = AtomicUsize::new(0);
+static ORB_HOOKED_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(target_os = "windows")]
-static ORB_ORIG_WNDPROC: AtomicUsize = AtomicUsize::new(0);
+static ORB_ORIG_WNDPROC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(target_os = "windows")]
 static ORB_FRAME_REPAIR_REENTRY: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "windows")]
 fn strip_orb_native_frame_styles(style: isize, extended_style: isize) -> (isize, isize) {
     (
         style & !ORB_NONCLIENT_FRAME_STYLE_MASK,
@@ -4119,10 +4480,16 @@ fn set_orb_window_region_for_focus(
 
 #[cfg(not(target_os = "windows"))]
 fn set_orb_window_region(
-    _window: &WebviewWindow,
-    _collapsed: bool,
-    _side: &str,
+    window: &WebviewWindow,
+    collapsed: bool,
+    side: &str,
 ) -> Result<(), String> {
+    use tauri::window::Color;
+
+    let _ = collapsed;
+    let _ = side;
+    let _ = window.set_title("");
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
     Ok(())
 }
 
@@ -4370,8 +4737,19 @@ fn get_floating_orb_pointer_inside(app: AppHandle) -> Result<bool, String> {
 
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
-fn get_floating_orb_pointer_inside() -> bool {
-    false
+fn get_floating_orb_pointer_inside(app: AppHandle) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("orb")
+        .ok_or("悬浮小球窗口尚未创建")?;
+    let cursor = window.cursor_position().map_err(|error| error.to_string())?;
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let x = cursor.x.round() as i32;
+    let y = cursor.y.round() as i32;
+    Ok(x >= position.x
+        && x < position.x + size.width as i32
+        && y >= position.y
+        && y < position.y + size.height as i32)
 }
 
 fn saved_floating_position(data: &PersistedState, style: &str) -> Option<SavedPosition> {

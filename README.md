@@ -1,10 +1,19 @@
 # AI Usage Meter
 
-面向多 AI 平台的 Windows 桌面用量监测器，在同一个界面查看额度和 Token 消耗。目前支持 Codex 与 Cursor，并采用可扩展的平台切换结构。支持缓存优先切换、按秒设置自动同步，以及可贴边停靠的悬浮卡片/水波球。
+面向多 AI 平台的桌面用量监测器，在同一个界面查看额度和 Token 消耗。目前支持 Codex 与 Cursor，并采用可扩展的平台切换结构。支持缓存优先切换、按秒设置自动同步，以及可贴边停靠的悬浮卡片/水波球。
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/clockclock1/ai-usage-meter/releases) 获取最新 Windows 安装包或独立可执行文件。
+从 [GitHub Releases](https://github.com/clockclock1/ai-usage-meter/releases) 获取最新安装包：
+
+| 平台 | 架构 | 文件 |
+| --- | --- | --- |
+| Windows | x64 | `AI-Usage-Meter-64bit-Setup.exe` / 便携 `AI-Usage-Meter-64bit.exe` |
+| Windows | ARM64 | `AI-Usage-Meter-ARM64-Setup.exe` / 便携 `AI-Usage-Meter-ARM64.exe` |
+| macOS | Apple Silicon | `AI-Usage-Meter_arm64.dmg` |
+| macOS | Intel | `AI-Usage-Meter_x64.dmg` |
+| Linux | amd64 | `AI-Usage-Meter_amd64.deb` / `AI-Usage-Meter_amd64.AppImage` |
+| Linux | arm64 | `AI-Usage-Meter_arm64.deb` / `AI-Usage-Meter_arm64.AppImage` |
 
 ## 功能
 
@@ -21,60 +30,55 @@
 ## 数据来源与隐私
 
 - **Codex 平台额度**通过本机 Codex App Server 的 JSON-RPC 接口读取；Codex Token 统计读取本机 `~/.codex/sessions` 会话日志。今日用量按本机时区统计。进行中会话同样扫描本机会话 JSONL 的近期增量。
-- **Cursor 平台额度**使用 Cursor 桌面端的本机登录状态读取账户用量；Cursor Token 统计由随应用提供的 Tokscale 组件同步并读取其本机缓存。Token 同步会复用新鲜缓存并遵守 Tokscale 的同步节流。进行中会话读取本机 `~/.cursor/projects/*/agent-transcripts` 的近期日志增量。会话快照与额度一样缓存在 EXE 旁 `data/state.json`，内存每 5 秒更新，磁盘约每分钟写入一次。
-- 应用不经过本项目的服务器转发统计请求。Cursor 登录凭据会从 Cursor 本机登录数据库读取，并写入当前 Windows 用户目录下的 Tokscale 本地凭据文件（`.config/tokscale/cursor-credentials.json`），供 Tokscale 使用；请妥善保护该 Windows 用户目录。
-- 应用设置、窗口位置和额度缓存保存在可执行文件旁的 `data/state.json`。Codex 会话日志与 Cursor 用量缓存不会上传到本项目。
+- **Cursor 平台额度**使用 Cursor 桌面端的本机登录状态读取账户用量；Cursor Token 统计由随应用提供的 Tokscale 组件同步并读取其本机缓存。Token 同步会复用新鲜缓存并遵守 Tokscale 的同步节流。进行中会话读取本机 `~/.cursor/projects/*/agent-transcripts` 的近期日志增量。
+- 应用不经过本项目的服务器转发统计请求。Cursor 登录凭据会从 Cursor 本机登录数据库读取，并写入当前用户目录下的 Tokscale 本地凭据文件（`.config/tokscale/cursor-credentials.json`），供 Tokscale 使用；请妥善保护该用户目录。
+- 应用设置、窗口位置和额度缓存保存在本机数据目录：Windows 为可执行文件旁 `data/state.json`，macOS 为 `~/Library/Application Support/AI Usage Meter`，Linux 为 `~/.local/share/ai-usage-meter`（或 `$XDG_DATA_HOME/ai-usage-meter`）。Codex 会话日志与 Cursor 用量缓存不会上传到本项目。
 - 支持系统代理、关闭代理或自定义 `http`、`https`、`socks5` 代理。
 
 ## 使用要求
 
-- Windows 10/11 与 WebView2
+- **Windows**：Windows 10/11 与 WebView2
+- **macOS**：较新的 macOS（Apple Silicon 或 Intel）
+- **Linux**：带 WebKitGTK 4.1 的桌面环境（deb / AppImage）
 - Codex Desktop 或 Codex CLI，并已使用 ChatGPT 账号登录（API Key 登录不提供 ChatGPT 订阅额度窗口）
 - 如需 Cursor 统计：安装 Cursor Desktop，并在应用中登录 Cursor 账号
 
-应用会自动查找 Codex Desktop、npm/nvm 全局安装目录及系统 `PATH` 中的 Codex。自定义安装位置可通过环境变量 `AI_USAGE_METER_CODEX_PATH` 指定 `codex.exe`。
+应用会自动查找 Codex Desktop、npm 全局安装目录及系统 `PATH` 中的 Codex。自定义安装位置可通过环境变量 `AI_USAGE_METER_CODEX_PATH` 指定 Codex 可执行文件。
 
 首次在电脑上配置 Codex 时，可在终端检查登录状态：
 
-```powershell
+```bash
 codex login
 codex login status
 ```
 
 ## 开发
 
-```powershell
+```bash
 npm install
 npm run tauri dev
 ```
 
 ## 本地构建
 
-```powershell
+```bash
+# 当前平台
 npm run tauri build
+
+# 指定产物（示例）
+npm run tauri -- build --bundles nsis
+npm run tauri -- build --bundles app,dmg
+npm run tauri -- build --bundles deb,appimage
 ```
 
-Windows 安装包位于 `src-tauri/target/release/bundle/`。应用同时使用随包提供的 Tokscale Windows 组件来读取 Cursor Token 用量。
+安装包位于 `src-tauri/target/release/bundle/`。应用同时使用随包提供的 Tokscale 组件读取 Cursor Token 用量。
 
 ## GitHub Actions 构建
 
-`.github/workflows/windows-build.yml` 会在推送分支、创建 Pull Request 或手动运行时构建 Windows x64 和 ARM64 版本。每个架构会生成：
+`.github/workflows/desktop-build.yml` 会在推送分支、创建 Pull Request 或手动运行时构建：
 
-- `AI-Usage-Meter-64bit-Setup.exe` / `AI-Usage-Meter-ARM64-Setup.exe`：NSIS 安装包。
-- `AI-Usage-Meter-64bit.exe` / `AI-Usage-Meter-ARM64.exe`：独立可执行文件。
+- Windows x64 / ARM64（NSIS + 独立 EXE）
+- macOS x64 / arm64（DMG + `.app` 压缩包）
+- Linux amd64 / arm64（deb + AppImage）
 
-普通工作流产物可从对应运行记录的 Artifacts 下载，保留 14 天。推送 `v` 开头的标签（例如 `v1.0.0`）时，安装包和独立 EXE 会附加到 GitHub Release。工作流只生成 Windows 产物。
-
-## 本地交叉编译
-
-安装 Rust MSVC 工具链和对应架构的 C++ 构建工具后，可编译单个目标：
-
-```powershell
-# Windows x64（Intel / AMD）
-rustup target add x86_64-pc-windows-msvc
-npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis
-
-# Windows ARM64
-rustup target add aarch64-pc-windows-msvc
-npm run tauri -- build --target aarch64-pc-windows-msvc --bundles nsis
-```
+普通工作流产物可从对应运行记录的 Artifacts 下载，保留 14 天。推送 `v` 开头的标签（例如 `v1.0.7`）时，上述产物会附加到 GitHub Release。

@@ -1,7 +1,7 @@
 [package]
 name = "ai-usage-meter"
-version = "1.0.6"
-description = "Multi-platform AI usage meter for Windows"
+version = "1.0.7"
+description = "Multi-platform AI usage meter for Windows, macOS, and Linux"
 authors = ["AI Usage Meter"]
 edition = "2021"
 
@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 base64 = "0.22"
+device_query = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks", "system-proxy"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 

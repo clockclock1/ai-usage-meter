@@ -2311,7 +2311,7 @@ function DashboardApp() {
               <label className="size-control">
                 <span><span className="settings-label">悬浮球尺寸</span><b>{floatingSettings.orbSize} px</b></span>
                 <input type="range" min={MIN_ORB_SIZE} max={MAX_ORB_SIZE} step="2" value={floatingSettings.orbSize} onChange={(event) => void setOrbSize(Number(event.target.value))} aria-label="悬浮球尺寸" />
-                <small className="settings-hint">直径 {MIN_ORB_SIZE}–{MAX_ORB_SIZE} 逻辑像素，随 Windows 显示缩放自动适配。</small>
+                <small className="settings-hint">直径 {MIN_ORB_SIZE}–{MAX_ORB_SIZE} 逻辑像素，随系统显示缩放自动适配。</small>
               </label>
               <label className="size-control">
                 <span><span className="settings-label">紧凑卡片尺寸</span><b>{floatingSettings.cardScale}%</b></span>
@@ -2346,7 +2346,7 @@ function DashboardApp() {
                 <button className={`compact-action ${floatingSettings.pinned ? "is-active" : ""}`} onClick={setPinned} disabled={floatingSettings.style === "orb"}>{floatingSettings.style === "orb" ? "小球可交互" : floatingSettings.pinned ? "取消固定" : "固定"}</button>
               </div>
               <div className="settings-block settings-block--inline">
-                <div><span className="settings-label">窗口置顶</span><small>{floatingSettings.alwaysOnTop ? "标准 Windows 置顶层级" : "跟随普通窗口层级"}</small></div>
+                <div><span className="settings-label">窗口置顶</span><small>{floatingSettings.alwaysOnTop ? "保持在其他窗口之上" : "跟随普通窗口层级"}</small></div>
                 <button className={`compact-action ${floatingSettings.alwaysOnTop ? "is-active" : ""}`} onClick={() => void setAlwaysOnTop()}>{floatingSettings.alwaysOnTop ? "已置顶" : "未置顶"}</button>
               </div>
               <label className="opacity-control"><span>黑色背景透明度 <b>{Math.round((1 - floatingSettings.opacity) * 100)}%</b></span><input type="range" min="0" max="100" value={Math.round((1 - floatingSettings.opacity) * 100)} onChange={(event) => void setOpacity(1 - Number(event.target.value) / 100)} /></label>
@@ -2363,7 +2363,7 @@ function DashboardApp() {
                   </div>
                 </div>
               </div>
-              <p>{floatingSettings.pinned ? "固定后主体会穿透鼠标，顶部图钉仍可取消固定。" : "设置会写入 EXE 同目录的 data 文件夹。"}</p>
+              <p>{floatingSettings.pinned ? "固定后主体会穿透鼠标，顶部图钉仍可取消固定。" : "设置会写入本机应用数据目录。"}</p>
               <small title={floatingSettings.dataDirectory}>设置自动保存在 data 文件夹</small>
               </PrettyScroller>
             </section>
